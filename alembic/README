@@ -1,0 +1,5 @@
+Generic single-database configuration for MindSurve.
+
+Migration scripts are generated into `versions/`. Alembic reads `DATABASE_URL`
+from application settings (`app.core.config`) rather than hardcoding it in
+`alembic.ini`.

@@ -1,0 +1,281 @@
+"""Project and chat business logic."""
+
+from __future__ import annotations
+
+import base64
+import binascii
+from datetime import datetime
+from uuid import UUID
+
+from sqlalchemy.orm import Session
+
+from app.core.exceptions import AppError, NotFoundError
+from app.db.models.chat import Chat, ChatMessage
+from app.db.models.project import Project
+from app.db.models.user import User
+from app.repositories.project_repository import ProjectRepository
+from app.schemas.project import ChatOut, MessageOut, MessagePageOut
+
+
+class ProjectService:
+    def __init__(self, db: Session) -> None:
+        self.db = db
+        self.repo = ProjectRepository(db)
+
+    # ── Projects ──────────────────────────────────────────────────────────
+
+    def list_projects(self, user: User) -> list[Project]:
+        return self.repo.list_projects_for_user(user.id)
+
+    def get_project(self, user: User, project_id: UUID) -> Project:
+        project = self.repo.get_project_for_user(project_id, user.id)
+        if project is None:
+            raise NotFoundError("Project not found.")
+        return project
+
+    def create_project(self, user: User, *, title: str) -> Project:
+        from app.core.exceptions import AppError
+
+        trimmed = title.strip()
+        if not trimmed:
+            raise AppError("Project title is required.", status_code=422)
+
+        try:
+            project = self.repo.create_project(user_id=user.id, title=trimmed)
+            self.db.commit()
+            self.db.refresh(project)
+            return project
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def rename_project(self, user: User, project_id: UUID, *, title: str) -> Project:
+        from app.core.exceptions import AppError
+
+        trimmed = title.strip()
+        if not trimmed:
+            raise AppError("Project title is required.", status_code=422)
+
+        project = self.get_project(user, project_id)
+        try:
+            project.name = trimmed
+            self.repo.save_project(project)
+            self.db.commit()
+            self.db.refresh(project)
+            return project
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def delete_project(self, user: User, project_id: UUID) -> None:
+        project = self.get_project(user, project_id)
+        try:
+            # DB CASCADE removes chats + messages
+            self.repo.delete_project(project)
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+
+    # ── Chats ─────────────────────────────────────────────────────────────
+
+    def list_chats_for_project(self, user: User, project_id: UUID) -> list[ChatOut]:
+        self.get_project(user, project_id)  # ownership check
+        chats = self.repo.list_chats_for_project(project_id)
+        return self._chats_with_previews(chats)
+
+    def list_all_chats(self, user: User) -> list[ChatOut]:
+        chats = self.repo.list_chats_for_user(user.id)
+        return self._chats_with_previews(chats)
+
+    def get_chat(self, user: User, chat_id: UUID) -> Chat:
+        chat = self.repo.get_chat_for_user(chat_id, user.id)
+        if chat is None:
+            raise NotFoundError("Chat not found.")
+        return chat
+
+    def create_chat(
+        self,
+        user: User,
+        project_id: UUID,
+        *,
+        title: str | None = None,
+    ) -> ChatOut:
+        project = self.get_project(user, project_id)
+        chat_title = (title or "New Chat").strip() or "New Chat"
+        try:
+            chat = self.repo.create_chat(project_id=project.id, title=chat_title)
+            # Touch project updated_at so project list ordering stays useful
+            self.repo.save_project(project)
+            self.db.commit()
+            self.db.refresh(chat)
+            return ChatOut.model_validate(chat)
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def start_chat_with_message(
+        self,
+        user: User,
+        project_id: UUID,
+        *,
+        content: str,
+    ) -> tuple[ChatOut, MessageOut]:
+        project = self.get_project(user, project_id)
+        body = content.strip()
+        from app.core.exceptions import AppError
+
+        if not body:
+            raise AppError("Message content is required.", status_code=422)
+
+        try:
+            chat = self.repo.create_chat(project_id=project.id, title="New Chat")
+            msg = self.repo.create_message(
+                chat_id=chat.id,
+                role="user",
+                content=body,
+            )
+            self.repo.save_chat(chat)
+            self.repo.save_project(project)
+            self.db.commit()
+            self.db.refresh(chat)
+            self.db.refresh(msg)
+            chat_out = ChatOut.model_validate(chat)
+            chat_out.last_message_preview = msg.content
+            return chat_out, self._message_out(msg)
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def rename_chat(self, user: User, chat_id: UUID, *, title: str) -> ChatOut:
+        from app.core.exceptions import AppError
+
+        trimmed = title.strip()
+        if not trimmed:
+            raise AppError("Chat title is required.", status_code=422)
+
+        chat = self.get_chat(user, chat_id)
+        try:
+            chat.title = trimmed
+            self.repo.save_chat(chat)
+            self.db.commit()
+            self.db.refresh(chat)
+            return ChatOut.model_validate(chat)
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def delete_chat(self, user: User, chat_id: UUID) -> None:
+        chat = self.get_chat(user, chat_id)
+        try:
+            self.repo.delete_chat(chat)
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+
+    # ── Messages ──────────────────────────────────────────────────────────
+
+    def list_messages(
+        self,
+        user: User,
+        chat_id: UUID,
+        *,
+        limit: int = 40,
+        before: str | None = None,
+    ) -> MessagePageOut:
+        self.get_chat(user, chat_id)
+        before_created_at: datetime | None = None
+        before_id: UUID | None = None
+        if before:
+            before_created_at, before_id = self._decode_message_cursor(before)
+
+        messages, has_more = self.repo.list_message_page(
+            chat_id,
+            limit=limit,
+            before_created_at=before_created_at,
+            before_id=before_id,
+        )
+        next_before = (
+            self._encode_message_cursor(messages[0]) if has_more and messages else None
+        )
+        return MessagePageOut(
+            items=[self._message_out(m) for m in messages],
+            has_more=has_more,
+            next_before=next_before,
+        )
+
+    def add_message(
+        self,
+        user: User,
+        chat_id: UUID,
+        *,
+        content: str,
+        role: str = "user",
+        metadata: dict | None = None,
+    ) -> MessageOut:
+        from app.core.exceptions import AppError
+
+        body = content.strip()
+        if not body:
+            raise AppError("Message content is required.", status_code=422)
+        if role not in {"user", "assistant", "system"}:
+            raise AppError("Invalid message role.", status_code=422)
+
+        chat = self.get_chat(user, chat_id)
+        project = self.repo.get_project_for_user(chat.project_id, user.id)
+        try:
+            msg = self.repo.create_message(
+                chat_id=chat.id,
+                role=role,
+                content=body,
+                metadata=metadata,
+            )
+            self.repo.save_chat(chat)
+            if project is not None:
+                self.repo.save_project(project)
+            self.db.commit()
+            self.db.refresh(msg)
+            return self._message_out(msg)
+        except Exception:
+            self.db.rollback()
+            raise
+
+    # ── Helpers ───────────────────────────────────────────────────────────
+
+    def _chats_with_previews(self, chats: list[Chat]) -> list[ChatOut]:
+        if not chats:
+            return []
+        previews = self.repo.latest_message_previews([c.id for c in chats])
+        result: list[ChatOut] = []
+        for chat in chats:
+            out = ChatOut.model_validate(chat)
+            out.last_message_preview = previews.get(chat.id)
+            result.append(out)
+        return result
+
+    @staticmethod
+    def _message_out(msg: ChatMessage) -> MessageOut:
+        return MessageOut(
+            id=msg.id,
+            chat_id=msg.chat_id,
+            role=msg.role,
+            content=msg.content,
+            created_at=msg.created_at,
+            metadata=msg.metadata_json,
+        )
+
+    @staticmethod
+    def _encode_message_cursor(message: ChatMessage) -> str:
+        raw = f"{message.created_at.isoformat()}|{message.id}".encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    @staticmethod
+    def _decode_message_cursor(cursor: str) -> tuple[datetime, UUID]:
+        try:
+            padded = cursor + ("=" * (-len(cursor) % 4))
+            raw = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+            created_at_raw, message_id_raw = raw.rsplit("|", 1)
+            return datetime.fromisoformat(created_at_raw), UUID(message_id_raw)
+        except (binascii.Error, ValueError, UnicodeDecodeError):
+            raise AppError("Invalid message cursor.", status_code=422) from None
