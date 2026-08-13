@@ -39,8 +39,10 @@ class Settings(BaseSettings):
     COOKIE_SECURE: bool = False
     COOKIE_SAMESITE: str = "lax"
 
-    # Optional: Unilever API base for study list/create (no trailing slash)
+    # Optional: Unilever study engine API (no trailing slash)
     UNILEVER_API_BASE_URL: str | None = None
+    # Optional WebSocket origin for Unilever job progress (defaults from API URL)
+    UNILEVER_WS_BASE_URL: str | None = None
 
     # OpenAI — study brief conversation
     OPENAI_API_KEY: str | None = None
@@ -50,8 +52,9 @@ class Settings(BaseSettings):
     AZURE_STORAGE_CONNECTION_STRING: str | None = None
     AZURE_STORAGE_CONTAINER_NAME: str | None = None
 
-    # Share link host for newly created studies (Unilever participate URL)
+    # Share / preview hosts for created studies
     STUDY_SHARE_BASE_URL: str = "https://mindsurve.com"
+    STUDY_PREVIEW_BASE_URL: str = "https://mindsurve.com/home/create-study/preview"
 
     @field_validator("DATABASE_URL", mode="before")
     @classmethod

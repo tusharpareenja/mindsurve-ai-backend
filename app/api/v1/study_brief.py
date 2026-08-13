@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, s
 from sqlalchemy.orm import Session
 
 from app.azure.blob_storage import get_blob_storage
+from app.services.document_extract import extract_document_text
 from app.core.exceptions import AppError
 from app.db.models.user import User
 from app.db.session import get_db
@@ -167,12 +168,17 @@ async def upload_chat_file(
         _raise(exc)
 
     data = await file.read()
+    # Prefer the browser's original name/type for extraction — blob storage may
+    # sanitize the stored filename.
+    original_name = (file.filename or "upload.bin").strip() or "upload.bin"
+    original_type = (file.content_type or "").strip() or "application/octet-stream"
+
     storage = get_blob_storage()
     try:
         uploaded = storage.upload_bytes(
             data=data,
-            filename=file.filename or "upload.bin",
-            content_type=file.content_type or "application/octet-stream",
+            filename=original_name,
+            content_type=original_type,
             folder=f"mindsurve/chats/{chat_id}",
         )
     except AppError as exc:
@@ -182,11 +188,17 @@ async def upload_chat_file(
     cleaned_path = (
         relative_path.strip()[:500] if relative_path and relative_path.strip() else None
     )
+    extracted = extract_document_text(
+        filename=original_name,
+        content_type=uploaded.content_type or original_type,
+        data=data,
+    )
     return UploadOut(
         url=uploaded.url,
-        filename=uploaded.filename,
+        filename=uploaded.filename or original_name,
         content_type=uploaded.content_type,
         size_bytes=uploaded.size_bytes,
         category=cleaned_category,
         relative_path=cleaned_path,
+        extracted_text=extracted,
     )

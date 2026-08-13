@@ -6,6 +6,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 
 from azure.core.exceptions import AzureError
 from azure.storage.blob import ContentSettings
@@ -85,6 +86,26 @@ class AzureBlobStorage:
             raise AppError("File is too large (max 25 MB).", status_code=422)
 
         ctype = (content_type or "application/octet-stream").split(";")[0].strip().lower()
+        # Browsers sometimes send application/octet-stream for .docx / .pdf — infer from extension.
+        if ctype not in ALLOWED_CONTENT_TYPES:
+            suffix = Path(filename or "").suffix.lower()
+            inferred = {
+                ".pdf": "application/pdf",
+                ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                ".doc": "application/msword",
+                ".txt": "text/plain",
+                ".csv": "text/csv",
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".webp": "image/webp",
+                ".gif": "image/gif",
+                ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                ".xls": "application/vnd.ms-excel",
+                ".zip": "application/zip",
+            }.get(suffix)
+            if inferred:
+                ctype = inferred
         if ctype not in ALLOWED_CONTENT_TYPES:
             raise AppError(
                 "This file type isn’t supported. Try an image, PDF, Word, Excel, CSV, or ZIP.",

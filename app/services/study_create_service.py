@@ -17,6 +17,7 @@ from app.core.config import get_settings
 from app.core.exceptions import AppError
 from app.schemas.study_brief import StudyBrief
 from app.services.study_brief_validator import apply_defaults, is_brief_ready_for_create
+from app.services.study_payload import audience_segmentation, category_uuid, element_uuid
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ def create_draft_study_from_brief(
     share_url = f"{base}/participate/{study_id}"
 
     rating = brief.rating_scale.model_dump()
-    audience: dict = {}
+    audience = audience_segmentation(brief)
 
     try:
         db.execute(
@@ -61,7 +62,7 @@ def create_draft_study_from_brief(
                     CAST(:rating_scale AS jsonb), CAST(:audience AS jsonb),
                     :creator_id, :project_id,
                     CAST('draft' AS study_status_enum), :share_token, :share_url,
-                    false, 5, 0, 0, 0
+                    false, 6, 0, 0, 0
                 )
                 """
             ),
@@ -84,7 +85,7 @@ def create_draft_study_from_brief(
 
         for order, cat in enumerate(brief.categories):
             cat_row_id = uuid4()
-            cat_logical_id = uuid4()
+            cat_logical_id = category_uuid(study_id, cat.name)
             db.execute(
                 text(
                     """
@@ -106,11 +107,11 @@ def create_draft_study_from_brief(
                 },
             )
             for el in cat.elements:
-                el_id = uuid4()
+                el_id = element_uuid(study_id, cat.name, el.name)
                 content = (el.content or el.name).strip()
                 if brief.study_type == "text":
                     element_type = "text"
-                    content = content[:1000]
+                    content = content[:150]
                 else:
                     element_type = el.element_type if el.element_type in {"image", "text"} else "image"
                 db.execute(
