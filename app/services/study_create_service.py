@@ -186,6 +186,104 @@ def create_draft_study_from_brief(
     return study_id
 
 
+def sync_study_metadata_from_brief(
+    db: Session,
+    *,
+    brief: StudyBrief,
+    changed_fields: list[str],
+) -> None:
+    """Persist non-stimulus brief edits without rebuilding generated tasks."""
+    if not brief.study_id:
+        return
+
+    metadata_fields = {
+        "title",
+        "background",
+        "language",
+        "main_question",
+        "orientation_text",
+        "rating_scale",
+        "audience",
+        "classification_questions",
+    }
+    changed = metadata_fields.intersection(changed_fields)
+    if not changed:
+        return
+
+    rating = brief.rating_scale.model_dump()
+    audience = audience_segmentation(brief)
+    db.execute(
+        text(
+            """
+            UPDATE studies
+            SET title = :title,
+                background = :background,
+                language = :language,
+                main_question = :main_question,
+                orientation_text = :orientation_text,
+                rating_scale = CAST(:rating_scale AS jsonb),
+                iped_parameters = CAST(:audience AS jsonb),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = :study_id
+            """
+        ),
+        {
+            "study_id": brief.study_id,
+            "title": brief.title.strip()[:255],
+            "background": brief.background.strip(),
+            "language": (brief.language or "en")[:10],
+            "main_question": brief.main_question.strip(),
+            "orientation_text": brief.orientation_text.strip(),
+            "rating_scale": _json(rating),
+            "audience": _json(audience),
+        },
+    )
+
+    if "classification_questions" not in changed:
+        return
+
+    db.execute(
+        text(
+            "DELETE FROM study_classification_questions WHERE study_id = :study_id"
+        ),
+        {"study_id": brief.study_id},
+    )
+    for q_order, question in enumerate(brief.classification_questions, start=1):
+        options = [
+            {
+                "id": chr(ord("A") + index) if index < 26 else str(index),
+                "text": option[:200],
+                "order": index + 1,
+            }
+            for index, option in enumerate(question.options)
+        ]
+        db.execute(
+            text(
+                """
+                INSERT INTO study_classification_questions (
+                    id, study_id, question_id, question_text, question_type,
+                    is_required, "order", answer_options, config
+                ) VALUES (
+                    :id, :study_id, :question_id, :question_text, :question_type,
+                    :is_required, :order, CAST(:answer_options AS jsonb),
+                    CAST(:config AS jsonb)
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "study_id": brief.study_id,
+                "question_id": f"Q{q_order}"[:10],
+                "question_text": question.question_text.strip()[:500],
+                "question_type": "multiple_choice",
+                "is_required": "Y" if question.is_required else "N",
+                "order": q_order,
+                "answer_options": _json(options),
+                "config": _json({"optional_classification_question": False}),
+            },
+        )
+
+
 def _json(value: object) -> str:
     import json
 

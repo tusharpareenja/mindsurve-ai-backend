@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections import OrderedDict
+from collections.abc import Iterable
 
 from app.schemas.study_brief import (
     AttachmentBrief,
@@ -374,17 +375,23 @@ def _classification_pool_for_domain(domain: str) -> list[ClassificationQuestionB
     ]
 
 
-def ensure_default_classification(brief: StudyBrief) -> StudyBrief:
+def ensure_default_classification(
+    brief: StudyBrief, *, avoid_texts: Iterable[str] | None = None
+) -> StudyBrief:
     """Guarantee enough screeners for the requested sample size.
 
     Target count = max(5, ceil(log2(N))) so capacity can cover N even at 2 options
     each (e.g. 200 → 8, 300 → 9). Uses domain-specific questions (SMB/AI, fitness,
     visual) instead of generic packaging copy when that doesn't fit the study.
+
+    ``avoid_texts`` holds questions the user just deleted, so backfilling never
+    restores the exact question they asked to remove.
     """
     data = brief.model_copy(deep=True)
     target = min_classification_question_count(data.audience.number_of_respondents)
     domain = _classification_domain(data)
     defaults = _classification_pool_for_domain(domain)
+    blocked = {text.strip().lower() for text in (avoid_texts or []) if text.strip()}
 
     existing = list(data.classification_questions)
     if domain != "visual":
@@ -399,10 +406,11 @@ def ensure_default_classification(brief: StudyBrief) -> StudyBrief:
     for item in defaults:
         if len(padded) >= target:
             break
-        if item.question_text.strip().lower() in existing_texts:
+        text = item.question_text.strip().lower()
+        if text in existing_texts or text in blocked:
             continue
         padded.append(item)
-        existing_texts.add(item.question_text.strip().lower())
+        existing_texts.add(text)
 
     extra = 1
     while len(padded) < target:

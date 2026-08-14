@@ -230,8 +230,8 @@ class StudyGenerationService:
             requires_regeneration=needs,
             changed_fields=changed,
             message=(
-                "Changing these fields will regenerate the study tasks. "
-                "Your previous task matrix will be replaced."
+                "These changes have not been applied yet. Applying them requires "
+                "replacing the previous task matrix and regenerating the study tasks."
                 if needs
                 else "These changes can be saved without regenerating tasks."
             ),

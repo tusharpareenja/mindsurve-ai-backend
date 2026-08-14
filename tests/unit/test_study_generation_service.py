@@ -17,6 +17,7 @@ from app.schemas.study_brief import (
     ElementBrief,
     RatingScaleBrief,
     StudyBrief,
+    StudyBriefUpdate,
 )
 from app.services.study_generation_service import StudyGenerationService
 from app.services.study_payload import fingerprint_brief
@@ -216,3 +217,101 @@ def test_start_fails_without_study_id(service):
     with pytest.raises(AppError) as exc:
         service.start(user, uuid4(), access_token="tok")
     assert exc.value.status_code == 422
+
+
+def test_statement_change_requires_confirmation_before_regeneration(service):
+    user = MagicMock()
+    user.id = uuid4()
+    chat_id = uuid4()
+    study_id = uuid4()
+    brief = _brief(study_id)
+    chat = MagicMock()
+    chat.id = chat_id
+    chat.project_id = uuid4()
+
+    ready = StudyGenerationRun(
+        id=uuid4(),
+        chat_id=chat_id,
+        project_id=chat.project_id,
+        user_id=user.id,
+        study_id=study_id,
+        revision=1,
+        status="ready",
+        progress=100,
+        message="ready",
+        fingerprint=fingerprint_brief(brief),
+        study_status="draft",
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    changed_categories = brief.model_copy(deep=True).categories
+    changed_categories[0].elements[0].name = "Updated statement"
+    patch = StudyBriefUpdate(categories=changed_categories)
+
+    service._owned_chat_brief = MagicMock(
+        return_value=(chat, MagicMock(), brief)
+    )
+    service.repo.latest_for_chat = MagicMock(return_value=ready)
+    service.projects.save_chat = MagicMock()
+
+    preview = service.preview_brief_changes(user, chat_id, patch)
+    assert preview.requires_regeneration is True
+    assert "categories" in preview.changed_fields
+    assert "not been applied" in preview.message
+
+    with pytest.raises(AppError) as exc:
+        service.apply_brief_and_regenerate(
+            user,
+            chat_id,
+            patch,
+            access_token="tok",
+            confirm_regeneration=False,
+        )
+
+    assert exc.value.status_code == 409
+    assert "Confirm" in exc.value.message
+    service.projects.save_chat.assert_not_called()
+
+
+def test_question_and_orientation_changes_do_not_require_regeneration(service):
+    user = MagicMock()
+    user.id = uuid4()
+    chat_id = uuid4()
+    study_id = uuid4()
+    brief = _brief(study_id)
+    chat = MagicMock()
+    chat.id = chat_id
+
+    ready = StudyGenerationRun(
+        id=uuid4(),
+        chat_id=chat_id,
+        project_id=uuid4(),
+        user_id=user.id,
+        study_id=study_id,
+        revision=1,
+        status="ready",
+        progress=100,
+        message="ready",
+        fingerprint=fingerprint_brief(brief),
+        study_status="draft",
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    patch = StudyBriefUpdate(
+        main_question="How relevant is this?",
+        orientation_text="Read each item and rate it.",
+        classification_questions=[
+            ClassificationQuestionBrief(
+                question_text="Updated screener?", options=["Yes", "No"]
+            )
+        ],
+    )
+
+    service._owned_chat_brief = MagicMock(
+        return_value=(chat, MagicMock(), brief)
+    )
+    service.repo.latest_for_chat = MagicMock(return_value=ready)
+
+    preview = service.preview_brief_changes(user, chat_id, patch)
+    assert preview.requires_regeneration is False
+    assert preview.changed_fields == []

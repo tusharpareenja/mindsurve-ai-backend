@@ -331,7 +331,44 @@ def _pad_category(
     return cat
 
 
-def ensure_text_study_structure(brief: StudyBrief) -> StudyBrief:
+def _category_key(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+
+
+def dedupe_similar_categories(brief: StudyBrief) -> StudyBrief:
+    """Merge categories that only differ by hyphen / spacing / case."""
+    data = brief.model_copy(deep=True)
+    merged: list[CategoryBrief] = []
+    index: dict[str, int] = {}
+    for cat in data.categories:
+        key = _category_key(cat.name)
+        if not key:
+            merged.append(cat)
+            continue
+        if key in index:
+            existing = merged[index[key]]
+            seen = {
+                (el.content or el.name).strip().lower() for el in existing.elements
+            }
+            for el in cat.elements:
+                line = (el.content or el.name).strip().lower()
+                if line and line not in seen:
+                    existing.elements.append(el)
+                    seen.add(line)
+            if " " in cat.name and "-" in existing.name:
+                existing.name = cat.name
+            continue
+        index[key] = len(merged)
+        merged.append(cat)
+    data.categories = merged
+    return data
+
+
+def ensure_text_study_structure(
+    brief: StudyBrief,
+    *,
+    target_categories: int | None = None,
+) -> StudyBrief:
     """Keep a valid 3+ category pack without inventing meta / title-based copy.
 
     - Drop statements that quote the study title or talk about the research.
@@ -342,13 +379,14 @@ def ensure_text_study_structure(brief: StudyBrief) -> StudyBrief:
         return brief
 
     data = brief.model_copy(deep=True)
+    data = dedupe_similar_categories(data)
     data = _strip_meta_statements(data)
     bank = _theme_bank(_domain(data))
     seen = _existing_texts(data)
     title = data.title or ""
 
     padded: list[CategoryBrief] = []
-    used_names = {c.name.strip().lower() for c in data.categories if c.name.strip()}
+    used_keys = {_category_key(c.name) for c in data.categories if _category_key(c.name)}
     bank_idx = 0
 
     for cat in data.categories:
@@ -373,18 +411,21 @@ def ensure_text_study_structure(brief: StudyBrief) -> StudyBrief:
         )
 
     padded = [c for c in padded if c.elements]
-    used_names = {c.name.strip().lower() for c in padded if c.name.strip()}
+    used_keys = {_category_key(c.name) for c in padded if _category_key(c.name)}
 
-    target_cats = (
-        TEXT_GENERATE_CATEGORIES
-        if len(padded) < MIN_TEXT_CATEGORIES
-        else len(padded)
-    )
+    if target_categories is not None:
+        target_cats = max(MIN_TEXT_CATEGORIES, min(MAX_TEXT_CATEGORIES, target_categories))
+    else:
+        target_cats = (
+            TEXT_GENERATE_CATEGORIES
+            if len(padded) < MIN_TEXT_CATEGORIES
+            else len(padded)
+        )
 
     for name, lines in bank:
         if len(padded) >= target_cats or len(padded) >= MAX_TEXT_CATEGORIES:
             break
-        if name.strip().lower() in used_names:
+        if _category_key(name) in used_keys:
             continue
         cat = CategoryBrief(name=name[:100], elements=[])
         cat = _pad_category(
@@ -397,15 +438,15 @@ def ensure_text_study_structure(brief: StudyBrief) -> StudyBrief:
         if len(cat.elements) < MIN_TEXT_STATEMENTS:
             continue
         padded.append(cat)
-        used_names.add(name.strip().lower())
+        used_keys.add(_category_key(name))
 
     n = 1
     generic = _theme_bank("generic")
     generic_lines = [line for _, lines in generic for line in lines]
-    while len(padded) < MIN_TEXT_CATEGORIES:
+    while len(padded) < target_cats:
         name = f"Theme {n}"
         n += 1
-        if name.lower() in used_names:
+        if _category_key(name) in used_keys:
             continue
         cat = CategoryBrief(name=name, elements=[])
         cat = _pad_category(
@@ -418,7 +459,7 @@ def ensure_text_study_structure(brief: StudyBrief) -> StudyBrief:
         if len(cat.elements) < MIN_TEXT_STATEMENTS:
             break
         padded.append(cat)
-        used_names.add(name.lower())
+        used_keys.add(_category_key(name))
 
     data.categories = padded[:MAX_TEXT_CATEGORIES]
     return data

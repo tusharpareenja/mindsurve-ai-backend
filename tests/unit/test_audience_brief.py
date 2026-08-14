@@ -28,6 +28,23 @@ def test_selected_segments_get_even_distribution() -> None:
     }
 
 
+def test_partial_distribution_is_scaled_to_100() -> None:
+    """A split under 100 used to fail review and hide "Continue with study"."""
+    audience = AudienceBrief(
+        age_distribution={"25-34": 40, "35-44": 30, "45-54": 20},
+    )
+
+    assert sum(audience.age_distribution.values()) == 100
+    assert list(audience.age_distribution) == ["25-34", "35-44", "45-54"]
+    assert audience.age_distribution["25-34"] > audience.age_distribution["45-54"]
+
+
+def test_over_100_distribution_is_scaled_down() -> None:
+    audience = AudienceBrief(age_distribution={"18-24": 80, "25-34": 80})
+
+    assert audience.age_distribution == {"18-24": 50, "25-34": 50}
+
+
 def test_explicit_distribution_is_preserved() -> None:
     audience = AudienceBrief(
         age_distribution={"18 - 24": 60, "25-34": 40},

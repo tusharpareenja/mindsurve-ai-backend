@@ -120,3 +120,109 @@ def test_patch_study_brief_title(client: TestClient) -> None:
     )
     assert patched.status_code == 200
     assert patched.json()["study_brief"]["title"] == "Pet Shedding Logo Study"
+    assert patched.json()["version"]["version"] >= 1
+
+
+def test_brief_version_history_and_restore(client: TestClient) -> None:
+    headers = _auth(client)
+    project = client.post(
+        "/api/v1/projects", headers=headers, json={"title": "Version Project"}
+    ).json()
+    chat = client.post(
+        f"/api/v1/projects/{project['id']}/chats",
+        headers=headers,
+        json={"title": "New Chat"},
+    ).json()
+    first = client.post(
+        f"/api/v1/chats/{chat['id']}/ai-turn",
+        headers=headers,
+        json={
+            "content": "I want to create a study on pet shedding logos",
+            "attachment_urls": [],
+        },
+    )
+    assert first.status_code == 201, first.text
+    original_title = first.json()["study_brief"]["title"]
+    assert original_title
+
+    versions = client.get(
+        f"/api/v1/chats/{chat['id']}/study-brief/versions", headers=headers
+    )
+    assert versions.status_code == 200, versions.text
+    assert versions.json()["total"] >= 1
+
+    patched = client.patch(
+        f"/api/v1/chats/{chat['id']}/study-brief",
+        headers=headers,
+        json={"title": "Changed Title For History"},
+    )
+    assert patched.status_code == 200
+    assert patched.json()["study_brief"]["title"] == "Changed Title For History"
+
+    listed = client.get(
+        f"/api/v1/chats/{chat['id']}/study-brief/versions", headers=headers
+    ).json()
+    assert listed["total"] >= 2
+    first_version = listed["versions"][0]["version"]
+
+    restored = client.post(
+        f"/api/v1/chats/{chat['id']}/study-brief/versions/{first_version}/restore",
+        headers=headers,
+    )
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["study_brief"]["title"] == original_title
+    assert restored.json()["version"]["version"] > first_version
+
+
+def test_duplicate_category_edit_adds_version(client: TestClient) -> None:
+    headers = _auth(client)
+    project = client.post(
+        "/api/v1/projects", headers=headers, json={"title": "Dedupe Project"}
+    ).json()
+    chat = client.post(
+        f"/api/v1/projects/{project['id']}/chats",
+        headers=headers,
+        json={"title": "New Chat"},
+    ).json()
+    first = client.post(
+        f"/api/v1/chats/{chat['id']}/ai-turn",
+        headers=headers,
+        json={
+            "content": "I want to create a text study on pet shedding",
+            "attachment_urls": [],
+        },
+    )
+    assert first.status_code == 201, first.text
+    brief = first.json()["study_brief"]
+    cats = brief["categories"]
+    assert cats
+    cats.append(
+        {
+            "name": cats[0]["name"].replace(" ", "-"),
+            "elements": cats[0]["elements"],
+        }
+    )
+    patched = client.patch(
+        f"/api/v1/chats/{chat['id']}/study-brief",
+        headers=headers,
+        json={"categories": cats},
+    )
+    assert patched.status_code == 200, patched.text
+    before = client.get(
+        f"/api/v1/chats/{chat['id']}/study-brief/versions", headers=headers
+    ).json()["total"]
+
+    edited = client.post(
+        f"/api/v1/chats/{chat['id']}/ai-turn",
+        headers=headers,
+        json={"content": "there is duplicate categories", "attachment_urls": []},
+    )
+    assert edited.status_code == 201, edited.text
+    names = [c["name"] for c in edited.json()["study_brief"]["categories"]]
+    keys = {"".join(ch for ch in name.lower() if ch.isalnum()) for name in names}
+    assert len(keys) == len(names)
+    after = client.get(
+        f"/api/v1/chats/{chat['id']}/study-brief/versions", headers=headers
+    ).json()
+    assert after["total"] > before
+    assert edited.json()["changed_fields"]

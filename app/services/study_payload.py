@@ -132,8 +132,8 @@ def build_generate_tasks_payload(brief: StudyBrief, study_id: UUID) -> dict[str,
     }
 
 
-def task_affecting_snapshot(brief: StudyBrief) -> dict[str, Any]:
-    """Canonical subset used for fingerprints and regeneration diffs."""
+def brief_change_snapshot(brief: StudyBrief) -> dict[str, Any]:
+    """Canonical editable brief fields used for change summaries and versions."""
     return {
         "title": brief.title.strip(),
         "background": brief.background.strip(),
@@ -175,6 +175,15 @@ def task_affecting_snapshot(brief: StudyBrief) -> dict[str, Any]:
     }
 
 
+def task_affecting_snapshot(brief: StudyBrief) -> dict[str, Any]:
+    """Stimulus fields that require rebuilding the generated task matrix."""
+    snapshot = brief_change_snapshot(brief)
+    return {
+        "study_type": snapshot["study_type"],
+        "categories": snapshot["categories"],
+    }
+
+
 def fingerprint_brief(brief: StudyBrief) -> str:
     payload = task_affecting_snapshot(brief)
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
@@ -184,6 +193,13 @@ def fingerprint_brief(brief: StudyBrief) -> str:
 def diff_task_affecting(before: StudyBrief, after: StudyBrief) -> list[str]:
     a = task_affecting_snapshot(before)
     b = task_affecting_snapshot(after)
+    return [key for key in ("study_type", "categories") if a.get(key) != b.get(key)]
+
+
+def diff_brief_fields(before: StudyBrief, after: StudyBrief) -> list[str]:
+    """Return all edited brief fields, including metadata that does not rebuild tasks."""
+    a = brief_change_snapshot(before)
+    b = brief_change_snapshot(after)
     changed: list[str] = []
     keys = [
         "title",

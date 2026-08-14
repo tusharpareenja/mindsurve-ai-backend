@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.azure.blob_storage import get_blob_storage
@@ -18,6 +20,7 @@ from app.schemas.study_brief import (
     AiTurnRequest,
     AiTurnResponse,
     AttachmentBrief,
+    BriefVersionListOut,
     StudyBriefOut,
     StudyBriefUpdate,
     StudyConfirmResponse,
@@ -46,7 +49,11 @@ def get_study_brief(
         phase, brief = service.get_brief(user, chat_id)
     except AppError as exc:
         _raise(exc)
-    return StudyBriefOut(phase=phase, study_brief=brief)
+    return StudyBriefOut(
+        phase=phase,
+        study_brief=brief,
+        version=service.version_meta(chat_id),
+    )
 
 
 @router.patch("/chats/{chat_id}/study-brief", response_model=StudyBriefOut)
@@ -60,7 +67,84 @@ def patch_study_brief(
         phase, brief = service.update_brief(user, chat_id, body)
     except AppError as exc:
         _raise(exc)
-    return StudyBriefOut(phase=phase, study_brief=brief)
+    return StudyBriefOut(
+        phase=phase,
+        study_brief=brief,
+        version=service.version_meta(chat_id),
+    )
+
+
+@router.get(
+    "/chats/{chat_id}/study-brief/versions",
+    response_model=BriefVersionListOut,
+)
+def list_study_brief_versions(
+    chat_id: UUID,
+    user: User = Depends(get_current_user),
+    service: StudyBriefService = Depends(get_brief_service),
+) -> BriefVersionListOut:
+    try:
+        return service.list_versions(user, chat_id)
+    except AppError as exc:
+        _raise(exc)
+    raise AssertionError  # pragma: no cover
+
+
+@router.post(
+    "/chats/{chat_id}/study-brief/versions/{version}/restore",
+    response_model=StudyBriefOut,
+)
+def restore_study_brief_version(
+    chat_id: UUID,
+    version: int,
+    user: User = Depends(get_current_user),
+    service: StudyBriefService = Depends(get_brief_service),
+) -> StudyBriefOut:
+    try:
+        phase, brief, _changed = service.restore_version(user, chat_id, version)
+    except AppError as exc:
+        _raise(exc)
+    return StudyBriefOut(
+        phase=phase,
+        study_brief=brief,
+        version=service.version_meta(chat_id),
+    )
+
+
+@router.post("/chats/{chat_id}/ai-think-stream")
+def ai_think_stream(
+    chat_id: UUID,
+    body: AiTurnRequest,
+    user: User = Depends(get_current_user),
+    service: StudyBriefService = Depends(get_brief_service),
+) -> StreamingResponse:
+    """Stream the model's live thinking for this turn (does not save the brief)."""
+    attachments = list(body.attachments)
+
+    def events():
+        try:
+            for piece in service.iter_thinking_tokens(
+                user,
+                chat_id,
+                content=body.content,
+                attachments=attachments,
+            ):
+                yield f"data: {json.dumps({'text': piece}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'done': True})}\n\n"
+        except AppError as exc:
+            yield f"data: {json.dumps({'error': exc.message})}\n\n"
+        except Exception:
+            yield f"data: {json.dumps({'error': 'Thinking stream stopped.'})}\n\n"
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post(
@@ -96,12 +180,19 @@ def ai_turn(
         )
     except AppError as exc:
         _raise(exc)
+    changed = []
+    if isinstance(assistant_msg.metadata, dict):
+        raw = assistant_msg.metadata.get("changed_fields")
+        if isinstance(raw, list):
+            changed = [str(item) for item in raw]
     return AiTurnResponse(
         user_message=user_msg.model_dump(mode="json"),
         assistant_message=assistant_msg.model_dump(mode="json"),
         phase=phase,
         study_brief=brief,
         suggested_chat_title=suggested,
+        version=service.version_meta(chat_id),
+        changed_fields=changed,
     )
 
 
@@ -122,6 +213,11 @@ def ai_continue(
     if result is None:
         return AiContinueEmptyResponse()
     assistant_msg, phase, brief, suggested = result
+    changed = []
+    if isinstance(assistant_msg.metadata, dict):
+        raw = assistant_msg.metadata.get("changed_fields")
+        if isinstance(raw, list):
+            changed = [str(item) for item in raw]
     return AiTurnResponse(
         user_message=None,
         assistant_message=assistant_msg.model_dump(mode="json"),
@@ -129,6 +225,8 @@ def ai_continue(
         study_brief=brief,
         suggested_chat_title=suggested,
         continued=True,
+        version=service.version_meta(chat_id),
+        changed_fields=changed,
     )
 
 

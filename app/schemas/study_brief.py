@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
@@ -23,6 +24,29 @@ _AGE_ALIASES = {
 }
 
 
+def _clip(value: Any, max_len: int) -> str:
+    return str(value or "")[:max_len]
+
+
+def _coerce_option_texts(value: Any) -> list[str]:
+    """Accept AI option objects `{text: ...}` as well as plain strings."""
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        if isinstance(item, dict):
+            text = str(
+                item.get("text") or item.get("label") or item.get("value") or ""
+            ).strip()
+        elif item is None:
+            text = ""
+        else:
+            text = str(item).strip()
+        if text:
+            out.append(text[:200])
+    return out
+
+
 class RatingScaleBrief(BaseModel):
     min_value: int = 1
     max_value: int = 5
@@ -30,12 +54,38 @@ class RatingScaleBrief(BaseModel):
     max_label: str = Field(default="Extremely", max_length=50)
     middle_label: str = Field(default="", max_length=50)
 
+    @model_validator(mode="before")
+    @classmethod
+    def clip_labels(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        for key in ("min_label", "max_label", "middle_label"):
+            if key in data:
+                data[key] = _clip(data[key], 50)
+        return data
+
 
 class ElementBrief(BaseModel):
     name: str = Field(default="", max_length=150)
     element_type: Literal["image", "text"] = "text"
     content: str = ""
     description: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_element(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        if "name" in data:
+            data["name"] = _clip(data["name"], 150)
+        raw_type = str(data.get("element_type") or "").strip().lower()
+        if raw_type in {"image", "img", "visual", "photo"}:
+            data["element_type"] = "image"
+        elif raw_type:
+            data["element_type"] = "text"
+        return data
 
 
 # Text-study structure (statements instead of images). Grid keeps looser image-folder limits.
@@ -53,9 +103,46 @@ MIN_GRID_ELEMENTS = 2
 MAX_GRID_ELEMENTS = 12
 
 
+def _coerce_elements(value: Any) -> list[Any]:
+    """Accept AI aliases: statements/items/messages, or a list of strings."""
+    if not isinstance(value, list):
+        return []
+    out: list[Any] = []
+    for item in value:
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                out.append(
+                    {"name": text[:150], "element_type": "text", "content": text}
+                )
+            continue
+        if item:
+            out.append(item)
+    return out
+
+
 class CategoryBrief(BaseModel):
     name: str = Field(default="", max_length=100)
     elements: list[ElementBrief] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def clip_name(cls, data: Any) -> Any:
+        if isinstance(data, str):
+            return {"name": _clip(data, 100), "elements": []}
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        if "name" in data:
+            data["name"] = _clip(data["name"], 100)
+        if not data.get("elements"):
+            for alias in ("statements", "items", "messages", "lines"):
+                if alias in data:
+                    data["elements"] = data[alias]
+                    break
+        if "elements" in data:
+            data["elements"] = _coerce_elements(data["elements"])
+        return data
 
 
 class ClassificationOptionBrief(BaseModel):
@@ -67,6 +154,30 @@ class ClassificationQuestionBrief(BaseModel):
     question_text: str = Field(default="", max_length=500)
     is_required: bool = True
     options: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_question(cls, data: Any) -> Any:
+        if isinstance(data, str):
+            return {"question_text": _clip(data, 500), "options": []}
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        if not data.get("question_text"):
+            for alias in ("question", "text", "prompt", "label"):
+                if data.get(alias):
+                    data["question_text"] = data[alias]
+                    break
+        if "question_text" in data:
+            data["question_text"] = _clip(data["question_text"], 500)
+        if not data.get("options"):
+            for alias in ("choices", "answers", "answer_options"):
+                if alias in data:
+                    data["options"] = data[alias]
+                    break
+        if "options" in data:
+            data["options"] = _coerce_option_texts(data["options"])
+        return data
 
     @field_validator("options")
     @classmethod
@@ -94,6 +205,20 @@ class AudienceBrief(BaseModel):
     countries: list[str] = Field(default_factory=list)
     gender_male: int = Field(default=50, ge=0, le=100)
     gender_female: int = Field(default=50, ge=0, le=100)
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_audience(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        raw_n = data.get("number_of_respondents")
+        if raw_n in ("", "null", "None", None):
+            data["number_of_respondents"] = None
+        elif isinstance(raw_n, str):
+            digits = "".join(ch for ch in raw_n if ch.isdigit())
+            data["number_of_respondents"] = int(digits) if digits else None
+        return data
 
     @field_validator("age_segments")
     @classmethod
@@ -176,6 +301,22 @@ class AudienceBrief(BaseModel):
         return self
 
 
+_STUDY_TYPE_ALIASES = {
+    "grid": "grid",
+    "image": "grid",
+    "images": "grid",
+    "visual": "grid",
+    "logo": "grid",
+    "packaging": "grid",
+    "text": "text",
+    "statement": "text",
+    "statements": "text",
+    "copy": "text",
+    "message": "text",
+    "messages": "text",
+}
+
+
 class StudyBrief(BaseModel):
     title: str = Field(default="", max_length=255)
     background: str = Field(default="", max_length=2000)
@@ -192,6 +333,67 @@ class StudyBrief(BaseModel):
     study_id: UUID | None = None
     missing_fields: list[str] = Field(default_factory=list)
 
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_ai_payload(cls, data: Any) -> Any:
+        """Make common LLM JSON mistakes valid instead of dropping the whole brief."""
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        if "title" in data:
+            data["title"] = _clip(data["title"], 255)
+        if "background" in data:
+            data["background"] = _clip(data["background"], 2000)
+        if "language" in data:
+            data["language"] = _clip(data["language"], 10) or "en"
+
+        raw_type = data.get("study_type")
+        if raw_type is None or raw_type == "":
+            data["study_type"] = None
+        elif isinstance(raw_type, str):
+            data["study_type"] = _STUDY_TYPE_ALIASES.get(raw_type.strip().lower())
+
+        raw_status = data.get("status")
+        if raw_status not in {"gathering", "ready", "confirmed", "created"}:
+            data["status"] = "gathering"
+
+        study_id = data.get("study_id")
+        if study_id in ("", "null", "None", None):
+            data["study_id"] = None
+        elif isinstance(study_id, str):
+            try:
+                UUID(study_id)
+            except ValueError:
+                data["study_id"] = None
+
+        attachments = data.get("attachments")
+        if isinstance(attachments, list):
+            data["attachments"] = [
+                item
+                for item in attachments
+                if isinstance(item, dict) and str(item.get("url") or "").strip()
+            ]
+
+        categories = data.get("categories")
+        if isinstance(categories, list):
+            data["categories"] = [
+                {"name": item, "elements": []} if isinstance(item, str) else item
+                for item in categories
+                if item
+            ]
+
+        questions = data.get("classification_questions")
+        if isinstance(questions, list):
+            data["classification_questions"] = [
+                {"question_text": item, "options": []}
+                if isinstance(item, str)
+                else item
+                for item in questions
+                if item
+            ]
+
+        return data
+
     def merge_attachments(self, new_items: list[AttachmentBrief]) -> None:
         seen = {a.url for a in self.attachments}
         for item in new_items:
@@ -206,6 +408,30 @@ class AiTurnRequest(BaseModel):
     attachments: list[AttachmentBrief] = Field(default_factory=list)
 
 
+class BriefVersionMeta(BaseModel):
+    version: int
+    total: int
+    summary: str = ""
+    source: str = "ai"
+    changed_fields: list[str] = Field(default_factory=list)
+    created_at: datetime | None = None
+
+
+class BriefVersionOut(BaseModel):
+    version: int
+    summary: str = ""
+    source: str = "ai"
+    changed_fields: list[str] = Field(default_factory=list)
+    created_at: datetime
+    study_brief: StudyBrief
+
+
+class BriefVersionListOut(BaseModel):
+    current_version: int
+    total: int
+    versions: list[BriefVersionOut]
+
+
 class AiTurnResponse(BaseModel):
     user_message: dict[str, Any] | None = None
     assistant_message: dict[str, Any]
@@ -213,6 +439,8 @@ class AiTurnResponse(BaseModel):
     study_brief: StudyBrief
     suggested_chat_title: str | None = None
     continued: bool = True
+    version: BriefVersionMeta | None = None
+    changed_fields: list[str] = Field(default_factory=list)
 
 
 class AiContinueEmptyResponse(BaseModel):
@@ -235,6 +463,7 @@ class StudyBriefUpdate(BaseModel):
 class StudyBriefOut(BaseModel):
     phase: BriefPhase
     study_brief: StudyBrief
+    version: BriefVersionMeta | None = None
 
 
 class StudyConfirmResponse(BaseModel):

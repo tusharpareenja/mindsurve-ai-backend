@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Iterator
 from typing import Any
 
 from app.core.config import get_settings
@@ -82,3 +83,42 @@ def chat_json(
             status_code=502,
         )
     return data
+
+
+def chat_stream(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float = 0.7,
+    max_tokens: int = 700,
+) -> Iterator[str]:
+    """Yield plain-text tokens from a streaming chat completion."""
+    settings = get_settings()
+    if not openai_configured():
+        return
+
+    try:
+        from openai import OpenAI
+    except ImportError:
+        return
+
+    client = OpenAI(api_key=settings.OPENAI_API_KEY, timeout=45.0)
+    try:
+        stream = client.chat.completions.create(
+            model=settings.OPENAI_MODEL,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        for event in stream:
+            delta = event.choices[0].delta if event.choices else None
+            piece = getattr(delta, "content", None) if delta else None
+            if piece:
+                yield piece
+    except Exception:
+        logger.exception("OpenAI thinking stream failed")
+        return

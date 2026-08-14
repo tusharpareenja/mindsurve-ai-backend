@@ -248,8 +248,222 @@ def test_ensure_text_study_strips_title_meta_lines() -> None:
             assert title.lower() not in (el.content or "").lower()
 
 
+def test_dedupe_hyphen_and_space_category_names() -> None:
+    from app.services.text_brief import dedupe_similar_categories
+
+    brief = StudyBrief(
+        study_type="text",
+        categories=[
+            CategoryBrief(
+                name="Middle Credit Messaging",
+                elements=[
+                    ElementBrief(name="A", element_type="text", content="A"),
+                    ElementBrief(name="B", element_type="text", content="B"),
+                    ElementBrief(name="C", element_type="text", content="C"),
+                ],
+            ),
+            CategoryBrief(
+                name="Middle-Credit Messaging",
+                elements=[
+                    ElementBrief(name="A", element_type="text", content="A"),
+                    ElementBrief(name="D", element_type="text", content="D"),
+                ],
+            ),
+            CategoryBrief(
+                name="Prime Messaging",
+                elements=[
+                    ElementBrief(name="E", element_type="text", content="E"),
+                    ElementBrief(name="F", element_type="text", content="F"),
+                    ElementBrief(name="G", element_type="text", content="G"),
+                ],
+            ),
+        ],
+    )
+    result = dedupe_similar_categories(brief)
+    names = [c.name for c in result.categories]
+    assert names == ["Middle Credit Messaging", "Prime Messaging"]
+    texts = {(el.content or el.name) for el in result.categories[0].elements}
+    assert texts == {"A", "B", "C", "D"}
+
+
 def test_ensure_text_study_ignores_grid() -> None:
     from app.services.text_brief import ensure_text_study_structure
 
     brief = StudyBrief(study_type="grid", categories=[])
     assert ensure_text_study_structure(brief).categories == []
+
+
+def _ready_text_brief() -> StudyBrief:
+    from app.services.folder_brief import ensure_default_classification
+    from app.services.study_brief_validator import is_brief_ready_for_review
+
+    brief = apply_defaults(ensure_default_classification(_text_brief(cats=3, statements=5)))
+    brief.status = "ready"
+    assert is_brief_ready_for_review(brief)
+    return brief
+
+
+def test_apply_dedupes_even_when_gpt_repeats_the_same_categories() -> None:
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from app.services.study_brief_service import StudyBriefService
+
+    current = _ready_text_brief()
+    dup = current.categories[0].model_copy(deep=True)
+    dup.name = current.categories[0].name.replace(" ", "-")
+    current.categories.append(dup)
+
+    service = StudyBriefService.__new__(StudyBriefService)
+    service.version_repo = SimpleNamespace(
+        max_version=lambda _chat_id: 2,
+        add=lambda row: row,
+    )
+    service.db = SimpleNamespace(rollback=lambda: None)
+
+    new, _phase, changed, intent = service._apply_ai_brief_update(
+        chat=SimpleNamespace(id=uuid4()),
+        brief=current,
+        ai_payload={
+            "intent": "answer",
+            "changed_fields": ["categories"],
+            "study_brief": current.model_dump(mode="json"),
+        },
+        intent="answer",
+        corpus="remove the duplicate categporied",
+        attachments=[],
+    )
+    assert intent == "build"
+    assert "categories" in changed
+    keys = {
+        "".join(ch for ch in cat.name.lower() if ch.isalnum())
+        for cat in new.categories
+    }
+    assert len(keys) == len(new.categories)
+
+
+def test_apply_honors_requested_category_count() -> None:
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from app.services.study_brief_service import StudyBriefService
+
+    current = _ready_text_brief()
+    assert len(current.categories) == 3
+    service = StudyBriefService.__new__(StudyBriefService)
+    service.version_repo = SimpleNamespace(
+        max_version=lambda _chat_id: 3,
+        add=lambda row: row,
+    )
+    service.db = SimpleNamespace(rollback=lambda: None)
+
+    new, _phase, changed, intent = service._apply_ai_brief_update(
+        chat=SimpleNamespace(id=uuid4()),
+        brief=current,
+        ai_payload={
+            "intent": "build",
+            "changed_fields": ["categories"],
+            "study_brief": current.model_dump(mode="json"),
+        },
+        intent="build",
+        corpus="i want 4 categories",
+        attachments=[],
+    )
+    assert intent == "build"
+    assert "categories" in changed
+    assert len(new.categories) == 4
+    keys = {
+        "".join(ch for ch in cat.name.lower() if ch.isalnum())
+        for cat in new.categories
+    }
+    assert len(keys) == 4
+
+
+def test_apply_four_categories_does_not_readd_hyphen_duplicate() -> None:
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from app.services.study_brief_service import StudyBriefService
+
+    current = _ready_text_brief()
+    payload_brief = current.model_dump(mode="json")
+    first = payload_brief["categories"][0]
+    payload_brief["categories"] = [
+        *payload_brief["categories"],
+        {
+            "name": first["name"].replace(" ", "-"),
+            "elements": first["elements"],
+        },
+    ]
+    service = StudyBriefService.__new__(StudyBriefService)
+    service.version_repo = SimpleNamespace(
+        max_version=lambda _chat_id: 3,
+        add=lambda row: row,
+    )
+    service.db = SimpleNamespace(rollback=lambda: None)
+
+    new, _phase, changed, _intent = service._apply_ai_brief_update(
+        chat=SimpleNamespace(id=uuid4()),
+        brief=current,
+        ai_payload={
+            "intent": "build",
+            "changed_fields": ["categories"],
+            "study_brief": payload_brief,
+        },
+        intent="build",
+        corpus="i want to have 4 categories currently we have 3",
+        attachments=[],
+    )
+    assert "categories" in changed
+    names = [cat.name for cat in new.categories]
+    keys = {"".join(ch for ch in name.lower() if ch.isalnum()) for name in names}
+    assert len(new.categories) == 4
+    assert len(keys) == 4
+    assert not any("-" in name and name.replace("-", " ") in names for name in names)
+
+
+def test_apply_merges_gpt_questions_without_wiping_categories() -> None:
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from app.services.study_brief_service import StudyBriefService
+
+    current = _ready_text_brief()
+    before_names = [cat.name for cat in current.categories]
+    service = StudyBriefService.__new__(StudyBriefService)
+    service.version_repo = SimpleNamespace(
+        max_version=lambda _chat_id: 2,
+        add=lambda row: row,
+    )
+    service.db = SimpleNamespace(rollback=lambda: None)
+
+    new, _phase, changed, intent = service._apply_ai_brief_update(
+        chat=SimpleNamespace(id=uuid4()),
+        brief=current,
+        ai_payload={
+            "intent": "build",
+            "changed_fields": ["classification_questions"],
+            "study_brief": {
+                "classification_questions": [
+                    {"question_text": "Do you own a car?", "options": ["Yes", "No"]},
+                    {
+                        "question_text": "What is your credit range?",
+                        "options": ["Low", "Mid", "High"],
+                    },
+                    {"question_text": "Who pays?", "options": ["Me", "Other"]},
+                    {"question_text": "When will you buy?", "options": ["Now", "Later"]},
+                    {
+                        "question_text": "Where do you shop?",
+                        "options": ["Dealer", "Online"],
+                    },
+                ]
+            },
+        },
+        intent="build",
+        corpus="change the classification questions",
+        attachments=[],
+    )
+    assert intent == "build"
+    assert "classification_questions" in changed
+    assert [cat.name for cat in new.categories] == before_names
+    assert new.classification_questions[0].question_text == "Do you own a car?"

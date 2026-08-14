@@ -122,12 +122,29 @@ def test_fingerprint_changes_when_element_changes() -> None:
     assert fingerprint_brief(brief) != original
 
 
-def test_diff_task_affecting_detects_audience_and_categories() -> None:
+def test_only_stimulus_changes_require_task_regeneration() -> None:
     before = _sample_brief()
     after = before.model_copy(deep=True)
     after.audience.gender_male = 50
     after.audience.gender_female = 50
+    after.main_question = "Updated rating question"
+    after.orientation_text = "Updated instructions"
+    after.classification_questions[0].question_text = "Updated screener?"
     after.categories[0].elements[0].content = "https://cdn.example/changed.png"
     changed = diff_task_affecting(before, after)
-    assert "audience" in changed
-    assert "categories" in changed
+    assert changed == ["categories"]
+
+
+def test_metadata_changes_do_not_invalidate_generated_tasks() -> None:
+    before = _sample_brief()
+    after = before.model_copy(deep=True)
+    original = fingerprint_brief(before)
+
+    after.main_question = "Updated rating question"
+    after.orientation_text = "Updated instructions"
+    after.classification_questions[0].question_text = "Updated screener?"
+    after.audience.gender_male = 50
+    after.audience.gender_female = 50
+
+    assert diff_task_affecting(before, after) == []
+    assert fingerprint_brief(after) == original
