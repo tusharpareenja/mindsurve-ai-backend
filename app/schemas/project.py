@@ -28,18 +28,21 @@ class ProjectOut(BaseModel):
     idea: str | None = None
     workflow_type: str = "beginner"
     status: str = "CREATED"
+    is_inbox: bool = False
     created_at: datetime
     updated_at: datetime
 
     @classmethod
     def from_project(cls, project: Project) -> ProjectOut:
+        workflow = project.workflow_type or "beginner"
         return cls(
             id=project.id,
             title=project.name,
             description=project.description or "",
             idea=project.idea,
-            workflow_type=project.workflow_type or "beginner",
+            workflow_type=workflow,
             status=project.status or "CREATED",
+            is_inbox=workflow == "inbox",
             created_at=project.created_at,
             updated_at=project.updated_at,
         )
@@ -54,7 +57,8 @@ class ChatStart(BaseModel):
 
 
 class ChatUpdate(BaseModel):
-    title: str = Field(min_length=1, max_length=200)
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    project_id: UUID | None = None
 
 
 class ChatOut(BaseModel):

@@ -26,7 +26,7 @@ def create_draft_study_from_brief(
     db: Session,
     *,
     creator_id: UUID,
-    project_id: UUID,
+    project_id: UUID | None,
     brief: StudyBrief,
 ) -> UUID:
     brief = apply_defaults(brief)

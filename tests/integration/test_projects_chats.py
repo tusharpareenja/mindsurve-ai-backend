@@ -234,3 +234,39 @@ def test_list_all_chats(client: TestClient) -> None:
     all_chats = client.get("/api/v1/chats", headers=headers)
     assert all_chats.status_code == 200
     assert len(all_chats.json()) == 2
+
+
+def test_move_and_delete_chat(client: TestClient) -> None:
+    headers = _auth_headers(client)
+    started = client.post(
+        "/api/v1/chats/start",
+        headers=headers,
+        json={"content": "Inbox idea"},
+    )
+    assert started.status_code == 201
+    chat_id = started.json()["chat"]["id"]
+    inbox_id = started.json()["chat"]["project_id"]
+
+    project_id = client.post(
+        "/api/v1/projects", headers=headers, json={"title": "Campaign"}
+    ).json()["id"]
+
+    moved = client.patch(
+        f"/api/v1/chats/{chat_id}",
+        headers=headers,
+        json={"project_id": project_id},
+    )
+    assert moved.status_code == 200
+    assert moved.json()["project_id"] == project_id
+
+    in_project = client.get(f"/api/v1/projects/{project_id}/chats", headers=headers)
+    assert in_project.status_code == 200
+    assert any(row["id"] == chat_id for row in in_project.json())
+
+    still_inbox = client.get(f"/api/v1/projects/{inbox_id}/chats", headers=headers)
+    assert still_inbox.status_code == 200
+    assert all(row["id"] != chat_id for row in still_inbox.json())
+
+    deleted = client.delete(f"/api/v1/chats/{chat_id}", headers=headers)
+    assert deleted.status_code == 200
+    assert client.get(f"/api/v1/chats/{chat_id}", headers=headers).status_code == 404

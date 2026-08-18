@@ -18,13 +18,26 @@ class ProjectRepository:
 
     # ── Projects (shared Unilever table: creator_id + name) ───────────────
 
-    def list_projects_for_user(self, user_id: UUID) -> list[Project]:
+    def list_projects_for_user(
+        self, user_id: UUID, *, include_inbox: bool = True
+    ) -> list[Project]:
+        stmt = select(Project).where(Project.creator_id == user_id)
+        if not include_inbox:
+            stmt = stmt.where(Project.workflow_type != "inbox")
+        stmt = stmt.order_by(Project.updated_at.desc())
+        return list(self.db.scalars(stmt).all())
+
+    def get_inbox_for_user(self, user_id: UUID) -> Project | None:
         stmt = (
             select(Project)
-            .where(Project.creator_id == user_id)
-            .order_by(Project.updated_at.desc())
+            .where(
+                Project.creator_id == user_id,
+                Project.workflow_type == "inbox",
+            )
+            .order_by(Project.created_at.asc())
+            .limit(1)
         )
-        return list(self.db.scalars(stmt).all())
+        return self.db.scalars(stmt).first()
 
     def get_project_for_user(self, project_id: UUID, user_id: UUID) -> Project | None:
         stmt = select(Project).where(
@@ -33,13 +46,20 @@ class ProjectRepository:
         )
         return self.db.scalars(stmt).first()
 
-    def create_project(self, *, user_id: UUID, title: str) -> Project:
+    def create_project(
+        self,
+        *,
+        user_id: UUID,
+        title: str,
+        workflow_type: str = "beginner",
+        description: str = "",
+    ) -> Project:
         now = datetime.now(UTC)
         project = Project(
             creator_id=user_id,
             name=title,
-            description="",
-            workflow_type="beginner",
+            description=description,
+            workflow_type=workflow_type,
             status="CREATED",
             created_at=now,
             updated_at=now,

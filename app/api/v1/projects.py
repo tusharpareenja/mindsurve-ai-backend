@@ -52,6 +52,15 @@ def create_project(
     return ProjectOut.from_project(project)
 
 
+@router.get("/inbox", response_model=ProjectOut)
+def get_or_create_inbox(
+    user: User = Depends(get_current_user),
+    service: ProjectService = Depends(get_project_service),
+) -> ProjectOut:
+    project = service.ensure_inbox(user)
+    return ProjectOut.from_project(project)
+
+
 @router.get("/{project_id}", response_model=ProjectOut)
 def get_project(
     project_id: UUID,

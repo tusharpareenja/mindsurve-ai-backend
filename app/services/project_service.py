@@ -16,6 +16,13 @@ from app.db.models.user import User
 from app.repositories.project_repository import ProjectRepository
 from app.schemas.project import ChatOut, MessageOut, MessagePageOut
 
+INBOX_TITLE = "Personal"
+INBOX_WORKFLOW = "inbox"
+
+
+def is_inbox_project(project: Project) -> bool:
+    return (project.workflow_type or "") == INBOX_WORKFLOW
+
 
 class ProjectService:
     def __init__(self, db: Session) -> None:
@@ -33,6 +40,28 @@ class ProjectService:
             raise NotFoundError("Project not found.")
         return project
 
+    def ensure_inbox(self, user: User) -> Project:
+        """Hidden personal workspace for chat-first (no user-created project)."""
+        existing = self.repo.get_inbox_for_user(user.id)
+        if existing is not None:
+            return existing
+        try:
+            project = self.repo.create_project(
+                user_id=user.id,
+                title=INBOX_TITLE,
+                workflow_type=INBOX_WORKFLOW,
+                description="MindSurve personal chats (hidden inbox)",
+            )
+            self.db.commit()
+            self.db.refresh(project)
+            return project
+        except Exception:
+            self.db.rollback()
+            existing = self.repo.get_inbox_for_user(user.id)
+            if existing is not None:
+                return existing
+            raise
+
     def create_project(self, user: User, *, title: str) -> Project:
         from app.core.exceptions import AppError
 
@@ -41,7 +70,11 @@ class ProjectService:
             raise AppError("Project title is required.", status_code=422)
 
         try:
-            project = self.repo.create_project(user_id=user.id, title=trimmed)
+            project = self.repo.create_project(
+                user_id=user.id,
+                title=trimmed,
+                workflow_type="beginner",
+            )
             self.db.commit()
             self.db.refresh(project)
             return project
@@ -57,6 +90,9 @@ class ProjectService:
             raise AppError("Project title is required.", status_code=422)
 
         project = self.get_project(user, project_id)
+        if is_inbox_project(project):
+            raise AppError("Personal chats can’t be renamed.", status_code=422)
+
         try:
             project.name = trimmed
             self.repo.save_project(project)
@@ -69,6 +105,11 @@ class ProjectService:
 
     def delete_project(self, user: User, project_id: UUID) -> None:
         project = self.get_project(user, project_id)
+        if is_inbox_project(project):
+            raise AppError(
+                "Personal chats can’t be deleted as a project. Delete individual chats instead.",
+                status_code=422,
+            )
         try:
             # DB CASCADE removes chats + messages
             self.repo.delete_project(project)
@@ -147,20 +188,54 @@ class ProjectService:
             self.db.rollback()
             raise
 
-    def rename_chat(self, user: User, chat_id: UUID, *, title: str) -> ChatOut:
-        from app.core.exceptions import AppError
+    def start_home_chat(
+        self,
+        user: User,
+        *,
+        content: str,
+    ) -> tuple[ChatOut, MessageOut]:
+        """Chat-first entry: start a study chat without creating a named project."""
+        inbox = self.ensure_inbox(user)
+        return self.start_chat_with_message(user, inbox.id, content=content)
 
-        trimmed = title.strip()
-        if not trimmed:
-            raise AppError("Chat title is required.", status_code=422)
+    def rename_chat(self, user: User, chat_id: UUID, *, title: str) -> ChatOut:
+        return self.update_chat(user, chat_id, title=title)
+
+    def update_chat(
+        self,
+        user: User,
+        chat_id: UUID,
+        *,
+        title: str | None = None,
+        project_id: UUID | None = None,
+    ) -> ChatOut:
+        if title is None and project_id is None:
+            raise AppError("Provide a title or a project to update.", status_code=422)
 
         chat = self.get_chat(user, chat_id)
+        old_project = self.repo.get_project_for_user(chat.project_id, user.id)
+        target_project = None
+        if project_id is not None:
+            target_project = self.get_project(user, project_id)
+
         try:
-            chat.title = trimmed
+            if title is not None:
+                trimmed = title.strip()
+                if not trimmed:
+                    raise AppError("Chat title is required.", status_code=422)
+                chat.title = trimmed
+            if target_project is not None:
+                chat.project_id = target_project.id
+                self.repo.save_project(target_project)
+                if old_project is not None and old_project.id != target_project.id:
+                    self.repo.save_project(old_project)
             self.repo.save_chat(chat)
             self.db.commit()
             self.db.refresh(chat)
             return ChatOut.model_validate(chat)
+        except AppError:
+            self.db.rollback()
+            raise
         except Exception:
             self.db.rollback()
             raise

@@ -60,6 +60,7 @@ from app.services.study_create_service import (
     create_draft_study_from_brief,
     sync_study_metadata_from_brief,
 )
+from app.services.project_service import is_inbox_project
 from app.services.synthetic_capacity import min_classification_question_count
 from app.services.text_brief import (
     dedupe_similar_categories,
@@ -720,10 +721,13 @@ class StudyBriefService:
             )
 
         try:
+            # Inbox ("Personal") chats are MindSurve-only containers — don't affiliate
+            # the Unilever study with that project (same as Unilever studies with no project).
+            unilever_project_id = None if is_inbox_project(project) else project.id
             study_id = create_draft_study_from_brief(
                 self.db,
                 creator_id=user.id,
-                project_id=project.id,
+                project_id=unilever_project_id,
                 brief=brief,
             )
             brief.study_id = study_id

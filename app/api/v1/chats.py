@@ -95,6 +95,24 @@ def start_chat(
     return ChatStartOut(chat=chat, message=message)
 
 
+@router.post(
+    "/chats/start",
+    response_model=ChatStartOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def start_home_chat(
+    body: ChatStart,
+    user: User = Depends(get_current_user),
+    service: ProjectService = Depends(get_project_service),
+) -> ChatStartOut:
+    """Start a chat in the user's personal inbox (no project creation required)."""
+    try:
+        chat, message = service.start_home_chat(user, content=body.content)
+    except AppError as exc:
+        _raise(exc)
+    return ChatStartOut(chat=chat, message=message)
+
+
 @router.get("/chats/{chat_id}", response_model=ChatOut)
 def get_chat(
     chat_id: UUID,
@@ -109,14 +127,19 @@ def get_chat(
 
 
 @router.patch("/chats/{chat_id}", response_model=ChatOut)
-def rename_chat(
+def update_chat(
     chat_id: UUID,
     body: ChatUpdate,
     user: User = Depends(get_current_user),
     service: ProjectService = Depends(get_project_service),
 ) -> ChatOut:
     try:
-        return service.rename_chat(user, chat_id, title=body.title)
+        return service.update_chat(
+            user,
+            chat_id,
+            title=body.title,
+            project_id=body.project_id,
+        )
     except AppError as exc:
         _raise(exc)
     raise AssertionError  # pragma: no cover
