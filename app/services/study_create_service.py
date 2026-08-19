@@ -17,7 +17,13 @@ from app.core.config import get_settings
 from app.core.exceptions import AppError
 from app.schemas.study_brief import StudyBrief
 from app.services.study_brief_validator import apply_defaults, is_brief_ready_for_create
-from app.services.study_payload import audience_segmentation, category_uuid, element_uuid
+from app.services.study_payload import (
+    audience_segmentation,
+    category_uuid,
+    element_uuid,
+    layer_uuid,
+    layer_image_uuid,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +41,11 @@ def create_draft_study_from_brief(
             "Your study brief isn’t complete yet. Please finish the missing details first.",
             status_code=422,
         )
-    if brief.study_type not in {"grid", "text"}:
-        raise AppError("Only grid and text studies are supported right now.", status_code=422)
+    if brief.study_type not in {"grid", "text", "layer"}:
+        raise AppError(
+            "Only grid, text, and layer studies are supported right now.",
+            status_code=422,
+        )
 
     settings = get_settings()
     study_id = uuid4()
@@ -55,14 +64,16 @@ def create_draft_study_from_brief(
                     id, title, background, language, main_question, orientation_text,
                     study_type, rating_scale, iped_parameters, creator_id, project_id,
                     status, share_token, share_url, toggle_shuffle, last_step,
-                    total_responses, completed_responses, abandoned_responses
+                    total_responses, completed_responses, abandoned_responses,
+                    background_image_url
                 ) VALUES (
                     :id, :title, :background, :language, :main_question, :orientation_text,
                     CAST(:study_type AS study_type_enum),
                     CAST(:rating_scale AS jsonb), CAST(:audience AS jsonb),
                     :creator_id, :project_id,
                     CAST('draft' AS study_status_enum), :share_token, :share_url,
-                    false, 6, 0, 0, 0
+                    false, 6, 0, 0, 0,
+                    :background_image_url
                 )
                 """
             ),
@@ -80,64 +91,131 @@ def create_draft_study_from_brief(
                 "project_id": project_id,
                 "share_token": share_token,
                 "share_url": share_url,
+                "background_image_url": (
+                    (brief.background_image_url or "").strip() or None
+                ),
             },
         )
 
-        for order, cat in enumerate(brief.categories):
-            cat_row_id = uuid4()
-            cat_logical_id = category_uuid(study_id, cat.name)
-            db.execute(
-                text(
-                    """
-                    INSERT INTO study_categories (
-                        id, study_id, category_id, name, "order", phase_type
-                    ) VALUES (
-                        :id, :study_id, :category_id, :name, :order,
-                        CAST(:phase_type AS study_type_enum)
-                    )
-                    """
-                ),
-                {
-                    "id": cat_row_id,
-                    "study_id": study_id,
-                    "category_id": cat_logical_id,
-                    "name": cat.name.strip()[:100],
-                    "order": order,
-                    "phase_type": brief.study_type,
-                },
-            )
-            for el in cat.elements:
-                el_id = element_uuid(study_id, cat.name, el.name)
-                content = (el.content or el.name).strip()
-                if brief.study_type == "text":
-                    element_type = "text"
-                    content = content[:150]
-                else:
-                    element_type = el.element_type if el.element_type in {"image", "text"} else "image"
+        if brief.study_type == "layer":
+            for layer in brief.layers:
+                layer_row_id = uuid4()
+                logical_layer_id = layer_uuid(study_id, layer.name)
+                transform = (
+                    layer.transform.model_dump()
+                    if layer.transform
+                    else {"x": 0.0, "y": 0.0, "width": 100.0, "height": 100.0}
+                )
                 db.execute(
                     text(
                         """
-                        INSERT INTO study_elements (
-                            id, study_id, category_id, element_id, name, description,
-                            element_type, content, alt_text
+                        INSERT INTO study_layers (
+                            id, study_id, layer_id, name, description, layer_type,
+                            z_index, "order", transform
                         ) VALUES (
-                            :id, :study_id, :category_id, :element_id, :name, :description,
-                            CAST(:element_type AS element_type_enum), :content, :alt_text
+                            :id, :study_id, :layer_id, :name, :description,
+                            CAST('image' AS layer_type_enum),
+                            :z_index, :order, CAST(:transform AS jsonb)
                         )
                         """
                     ),
                     {
-                        "id": uuid4(),
+                        "id": layer_row_id,
                         "study_id": study_id,
-                        "category_id": cat_row_id,
-                        "element_id": el_id,
-                        "name": el.name.strip()[:1000],
-                        "description": (el.description or None),
-                        "element_type": element_type,
-                        "content": content,
-                        "alt_text": el.name.strip()[:200] or None,
+                        "layer_id": str(logical_layer_id),
+                        "name": layer.name.strip()[:100],
+                        "description": None,
+                        "z_index": int(layer.z_index),
+                        "order": int(layer.order),
+                        "transform": _json(transform),
                     },
                 )
+                for el in layer.elements:
+                    img_logical_id = layer_image_uuid(study_id, layer.name, el.name)
+                    el_transform = (
+                        el.transform.model_dump()
+                        if el.transform
+                        else {"x": 0.0, "y": 0.0, "width": 100.0, "height": 100.0}
+                    )
+                    db.execute(
+                        text(
+                            """
+                            INSERT INTO layer_images (
+                                id, layer_id, image_id, name, url, alt_text,
+                                "order", config
+                            ) VALUES (
+                                :id, :layer_id, :image_id, :name, :url, :alt_text,
+                                :order, CAST(:config AS jsonb)
+                            )
+                            """
+                        ),
+                        {
+                            "id": uuid4(),
+                            "layer_id": layer_row_id,
+                            "image_id": str(img_logical_id),
+                            "name": el.name.strip()[:100],
+                            "url": (el.content or "").strip(),
+                            "alt_text": el.name.strip()[:200] or None,
+                            "order": int(el.order),
+                            "config": _json(el_transform),
+                        },
+                    )
+        else:
+            for order, cat in enumerate(brief.categories):
+                cat_row_id = uuid4()
+                cat_logical_id = category_uuid(study_id, cat.name)
+                db.execute(
+                    text(
+                        """
+                        INSERT INTO study_categories (
+                            id, study_id, category_id, name, "order", phase_type
+                        ) VALUES (
+                            :id, :study_id, :category_id, :name, :order,
+                            CAST(:phase_type AS study_type_enum)
+                        )
+                        """
+                    ),
+                    {
+                        "id": cat_row_id,
+                        "study_id": study_id,
+                        "category_id": cat_logical_id,
+                        "name": cat.name.strip()[:100],
+                        "order": order,
+                        "phase_type": brief.study_type,
+                    },
+                )
+                for el in cat.elements:
+                    el_id = element_uuid(study_id, cat.name, el.name)
+                    content = (el.content or el.name).strip()
+                    if brief.study_type == "text":
+                        element_type = "text"
+                        content = content[:150]
+                    else:
+                        element_type = el.element_type if el.element_type in {"image", "text"} else "image"
+                    db.execute(
+                        text(
+                            """
+                            INSERT INTO study_elements (
+                                id, study_id, category_id, element_id, name, description,
+                                element_type, content, alt_text
+                            ) VALUES (
+                                :id, :study_id, :category_id, :element_id, :name, :description,
+                                CAST(:element_type AS element_type_enum), :content, :alt_text
+                            )
+                            """
+                        ),
+                        {
+                            "id": uuid4(),
+                            "study_id": study_id,
+                            "category_id": cat_row_id,
+                            "element_id": el_id,
+                            "name": el.name.strip()[:1000],
+                            "description": (el.description or None),
+                            "element_type": element_type,
+                            "content": content,
+                            "alt_text": el.name.strip()[:200] or None,
+                        },
+                    )
 
         for q_order, q in enumerate(brief.classification_questions, start=1):
             options = []

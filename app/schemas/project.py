@@ -29,12 +29,14 @@ class ProjectOut(BaseModel):
     workflow_type: str = "beginner"
     status: str = "CREATED"
     is_inbox: bool = False
+    is_owner: bool = True
     created_at: datetime
     updated_at: datetime
 
     @classmethod
-    def from_project(cls, project: Project) -> ProjectOut:
+    def from_project(cls, project: Project, *, viewer_id: UUID | None = None) -> ProjectOut:
         workflow = project.workflow_type or "beginner"
+        is_owner = True if viewer_id is None else project.creator_id == viewer_id
         return cls(
             id=project.id,
             title=project.name,
@@ -43,9 +45,32 @@ class ProjectOut(BaseModel):
             workflow_type=workflow,
             status=project.status or "CREATED",
             is_inbox=workflow == "inbox",
+            is_owner=is_owner,
             created_at=project.created_at,
             updated_at=project.updated_at,
         )
+
+
+class CollaboratorInvite(BaseModel):
+    email: str = Field(min_length=3, max_length=255)
+
+
+class CollaboratorOut(BaseModel):
+    id: str
+    email: str
+    name: str | None = None
+    is_owner: bool = False
+    status: Literal["active", "pending"] = "active"
+
+
+class CollaboratorInviteResult(BaseModel):
+    id: str
+    email: str
+    status: Literal["active", "pending"]
+    message: str = "Invitation sent."
+    project_id: UUID | None = None
+    chat_id: UUID | None = None
+    promoted_from_inbox: bool = False
 
 
 class ChatCreate(BaseModel):

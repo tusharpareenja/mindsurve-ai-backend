@@ -256,6 +256,8 @@ async def upload_chat_file(
     file: UploadFile = File(...),
     category: str | None = Form(default=None),
     relative_path: str | None = Form(default=None),
+    is_background: str | None = Form(default=None),
+    layer_order: str | None = Form(default=None),
     user: User = Depends(get_current_user),
     service: StudyBriefService = Depends(get_brief_service),
 ) -> UploadOut:
@@ -286,6 +288,10 @@ async def upload_chat_file(
     cleaned_path = (
         relative_path.strip()[:500] if relative_path and relative_path.strip() else None
     )
+    bg_flag = (is_background or "").strip().lower() in {"1", "true", "yes", "y"}
+    parsed_order: int | None = None
+    if layer_order is not None and str(layer_order).strip().lstrip("-").isdigit():
+        parsed_order = int(str(layer_order).strip())
     extracted = extract_document_text(
         filename=original_name,
         content_type=uploaded.content_type or original_type,
@@ -299,4 +305,6 @@ async def upload_chat_file(
         category=cleaned_category,
         relative_path=cleaned_path,
         extracted_text=extracted,
+        is_background=bg_flag,
+        layer_order=parsed_order,
     )

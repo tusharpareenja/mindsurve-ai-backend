@@ -46,6 +46,89 @@ def test_folder_categories_become_grid_structure() -> None:
     assert result.categories[0].elements[0].content.endswith("a1.png")
 
 
+def test_root_image_plus_subfolders_become_layer_study() -> None:
+    brief = StudyBrief(title="Pack")
+    attachments = [
+        AttachmentBrief(
+            url="https://cdn.example/bg.png",
+            filename="background.png",
+            content_type="image/png",
+            is_background=True,
+        ),
+        AttachmentBrief(
+            url="https://cdn.example/logo1.png",
+            filename="Logo/logo1.png",
+            content_type="image/png",
+            category="Logo",
+            layer_order=0,
+        ),
+        AttachmentBrief(
+            url="https://cdn.example/logo2.png",
+            filename="Logo/logo2.png",
+            content_type="image/png",
+            category="Logo",
+            layer_order=0,
+        ),
+        AttachmentBrief(
+            url="https://cdn.example/logo3.png",
+            filename="Logo/logo3.png",
+            content_type="image/png",
+            category="Logo",
+            layer_order=0,
+        ),
+        AttachmentBrief(
+            url="https://cdn.example/shape1.png",
+            filename="Shape/shape1.png",
+            content_type="image/png",
+            category="Shape",
+            layer_order=1,
+        ),
+        AttachmentBrief(
+            url="https://cdn.example/shape2.png",
+            filename="Shape/shape2.png",
+            content_type="image/png",
+            category="Shape",
+            layer_order=1,
+        ),
+        AttachmentBrief(
+            url="https://cdn.example/shape3.png",
+            filename="Shape/shape3.png",
+            content_type="image/png",
+            category="Shape",
+            layer_order=1,
+        ),
+        AttachmentBrief(
+            url="https://cdn.example/color1.png",
+            filename="Color/color1.png",
+            content_type="image/png",
+            category="Color",
+            layer_order=2,
+        ),
+        AttachmentBrief(
+            url="https://cdn.example/color2.png",
+            filename="Color/color2.png",
+            content_type="image/png",
+            category="Color",
+            layer_order=2,
+        ),
+        AttachmentBrief(
+            url="https://cdn.example/color3.png",
+            filename="Color/color3.png",
+            content_type="image/png",
+            category="Color",
+            layer_order=2,
+        ),
+    ]
+    result = apply_folder_categories(brief, attachments)
+    assert result.study_type == "layer"
+    assert result.background_image_url and result.background_image_url.endswith("bg.png")
+    assert [layer.name for layer in result.layers] == ["Logo", "Shape", "Color"]
+    assert [layer.z_index for layer in result.layers] == [0, 1, 2]
+    assert len(result.layers[0].elements) == 3
+    assert result.layers[0].elements[0].transform.width == 100
+    assert result.categories == []
+
+
 def test_pdf_attachments_do_not_become_grid_elements() -> None:
     brief = StudyBrief(title="Copy test", study_type="text")
     attachments = [

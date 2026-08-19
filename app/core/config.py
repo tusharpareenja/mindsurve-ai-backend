@@ -56,6 +56,13 @@ class Settings(BaseSettings):
     STUDY_SHARE_BASE_URL: str = "https://mindsurve.com"
     STUDY_PREVIEW_BASE_URL: str = "https://mindsurve.com/home/create-study/preview"
 
+    # Optional SMTP for collaborator invites (best-effort; invites still persist without it)
+    SMTP_SERVER: str | None = None
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str | None = None
+    SMTP_PASSWORD: str | None = None
+    FROM_EMAIL: str | None = None
+
     @field_validator("DATABASE_URL", mode="before")
     @classmethod
     def normalize_database_url(cls, value: object) -> object:

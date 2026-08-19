@@ -8,7 +8,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-StudyTypeLit = Literal["grid", "text"]
+StudyTypeLit = Literal["grid", "text", "layer"]
 BriefPhase = Literal["gathering", "brief_ready", "creating", "created"]
 BriefStatus = Literal["gathering", "ready", "confirmed", "created"]
 
@@ -101,6 +101,12 @@ MIN_GRID_CATEGORIES = 2
 MAX_GRID_CATEGORIES = 15
 MIN_GRID_ELEMENTS = 2
 MAX_GRID_ELEMENTS = 12
+MIN_LAYER_LAYERS = 3
+MAX_LAYER_LAYERS = 15
+MIN_LAYER_ELEMENTS = 3
+MAX_LAYER_ELEMENTS = 30
+
+DEFAULT_LAYER_TRANSFORM = {"x": 0.0, "y": 0.0, "width": 100.0, "height": 100.0}
 
 
 def _coerce_elements(value: Any) -> list[Any]:
@@ -142,6 +148,97 @@ class CategoryBrief(BaseModel):
                     break
         if "elements" in data:
             data["elements"] = _coerce_elements(data["elements"])
+        return data
+
+
+class LayerTransformBrief(BaseModel):
+    x: float = 0.0
+    y: float = 0.0
+    width: float = 100.0
+    height: float = 100.0
+
+    @model_validator(mode="before")
+    @classmethod
+    def clamp_values(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return DEFAULT_LAYER_TRANSFORM.copy()
+        out = dict(DEFAULT_LAYER_TRANSFORM)
+        for key in ("x", "y", "width", "height"):
+            raw = data.get(key, out[key])
+            try:
+                val = float(raw)
+            except (TypeError, ValueError):
+                val = out[key]
+            out[key] = max(0.0, min(100.0, val))
+        return out
+
+
+class LayerElementBrief(BaseModel):
+    name: str = Field(default="", max_length=150)
+    content: str = ""
+    order: int = 0
+    transform: LayerTransformBrief = Field(
+        default_factory=lambda: LayerTransformBrief(**DEFAULT_LAYER_TRANSFORM)
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_element(cls, data: Any) -> Any:
+        if isinstance(data, str):
+            return {
+                "name": _clip(data, 150),
+                "content": data,
+                "order": 0,
+                "transform": DEFAULT_LAYER_TRANSFORM.copy(),
+            }
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        if "name" in data:
+            data["name"] = _clip(data["name"], 150)
+        if not data.get("content") and data.get("url"):
+            data["content"] = data["url"]
+        if "transform" not in data:
+            data["transform"] = DEFAULT_LAYER_TRANSFORM.copy()
+        return data
+
+
+class LayerBrief(BaseModel):
+    name: str = Field(default="", max_length=100)
+    z_index: int = 0
+    order: int = 0
+    elements: list[LayerElementBrief] = Field(default_factory=list)
+    transform: LayerTransformBrief = Field(
+        default_factory=lambda: LayerTransformBrief(**DEFAULT_LAYER_TRANSFORM)
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_layer(cls, data: Any) -> Any:
+        if isinstance(data, str):
+            return {
+                "name": _clip(data, 100),
+                "elements": [],
+                "z_index": 0,
+                "order": 0,
+                "transform": DEFAULT_LAYER_TRANSFORM.copy(),
+            }
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        if "name" in data:
+            data["name"] = _clip(data["name"], 100)
+        if "z_index" not in data and "order" in data:
+            data["z_index"] = data["order"]
+        if "order" not in data and "z_index" in data:
+            data["order"] = data["z_index"]
+        if "transform" not in data:
+            data["transform"] = DEFAULT_LAYER_TRANSFORM.copy()
+        if not data.get("elements"):
+            for alias in ("images", "items"):
+                if alias in data:
+                    data["elements"] = data[alias]
+                    break
         return data
 
 
@@ -194,6 +291,30 @@ class AttachmentBrief(BaseModel):
     relative_path: str | None = None
     # Present on the current AI turn only — not persisted on the chat brief.
     extracted_text: str | None = None
+    is_background: bool = False
+    layer_order: int | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_flags(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        raw_bg = data.get("is_background")
+        if isinstance(raw_bg, str):
+            data["is_background"] = raw_bg.strip().lower() in {"1", "true", "yes", "y"}
+        elif raw_bg is None:
+            data["is_background"] = False
+        else:
+            data["is_background"] = bool(raw_bg)
+        raw_order = data.get("layer_order")
+        if raw_order in ("", "null", "None", None):
+            data["layer_order"] = None
+        elif isinstance(raw_order, str) and raw_order.strip().isdigit():
+            data["layer_order"] = int(raw_order.strip())
+        elif isinstance(raw_order, (int, float)):
+            data["layer_order"] = int(raw_order)
+        return data
 
 
 class AudienceBrief(BaseModel):
@@ -314,6 +435,12 @@ _STUDY_TYPE_ALIASES = {
     "copy": "text",
     "message": "text",
     "messages": "text",
+    "layer": "layer",
+    "layers": "layer",
+    "layered": "layer",
+    "pack shot": "layer",
+    "packshot": "layer",
+    "composite": "layer",
 }
 
 
@@ -326,6 +453,8 @@ class StudyBrief(BaseModel):
     orientation_text: str = ""
     rating_scale: RatingScaleBrief = Field(default_factory=RatingScaleBrief)
     categories: list[CategoryBrief] = Field(default_factory=list)
+    layers: list[LayerBrief] = Field(default_factory=list)
+    background_image_url: str | None = None
     classification_questions: list[ClassificationQuestionBrief] = Field(default_factory=list)
     audience: AudienceBrief = Field(default_factory=AudienceBrief)
     attachments: list[AttachmentBrief] = Field(default_factory=list)
@@ -381,6 +510,17 @@ class StudyBrief(BaseModel):
                 for item in categories
                 if item
             ]
+
+        layers = data.get("layers")
+        if isinstance(layers, list):
+            data["layers"] = [
+                {"name": item, "elements": []} if isinstance(item, str) else item
+                for item in layers
+                if item
+            ]
+        bg_url = data.get("background_image_url")
+        if bg_url in ("", "null", "None", None):
+            data["background_image_url"] = None
 
         questions = data.get("classification_questions")
         if isinstance(questions, list):
@@ -481,3 +621,5 @@ class UploadOut(BaseModel):
     category: str | None = None
     relative_path: str | None = None
     extracted_text: str | None = None
+    is_background: bool = False
+    layer_order: int | None = None

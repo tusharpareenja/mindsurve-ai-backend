@@ -38,7 +38,7 @@ def chat_json(
         raise AppError("AI client is unavailable.", status_code=503) from exc
 
     # Bound wait so proxies don't hang forever on large attachment turns.
-    client = OpenAI(api_key=settings.OPENAI_API_KEY, timeout=75.0)
+    client = OpenAI(api_key=settings.OPENAI_API_KEY, timeout=120.0)
     try:
         completion = client.chat.completions.create(
             model=settings.OPENAI_MODEL,

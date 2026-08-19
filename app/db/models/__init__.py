@@ -3,6 +3,7 @@
 from app.db.base import Base
 from app.db.models.auth_session import AuthSession
 from app.db.models.chat import Chat, ChatMessage
+from app.db.models.membership import ProjectMember, StudyMember
 from app.db.models.project import Project
 from app.db.models.study_brief_version import StudyBriefVersion
 from app.db.models.study_generation_run import StudyGenerationRun
@@ -14,6 +15,8 @@ __all__ = [
     "User",
     "AuthSession",
     "Project",
+    "ProjectMember",
+    "StudyMember",
     "Chat",
     "ChatMessage",
     "StudyBriefVersion",

@@ -7,10 +7,14 @@ from collections import OrderedDict
 from collections.abc import Iterable
 
 from app.schemas.study_brief import (
+    DEFAULT_LAYER_TRANSFORM,
     AttachmentBrief,
     CategoryBrief,
     ClassificationQuestionBrief,
     ElementBrief,
+    LayerBrief,
+    LayerElementBrief,
+    LayerTransformBrief,
     StudyBrief,
 )
 from app.services.synthetic_capacity import min_classification_question_count
@@ -90,15 +94,114 @@ def _ensure_unique_element_names(brief: StudyBrief) -> StudyBrief:
                 el.name = base[: 150 - len(suffix)] + suffix
             else:
                 seen[key] = 1
+    for layer in brief.layers:
+        for el in layer.elements:
+            base = (el.name or "").strip() or "Element"
+            key = base.lower()
+            if key in seen:
+                seen[key] += 1
+                suffix = f" ({seen[key]})"
+                el.name = base[: 150 - len(suffix)] + suffix
+            else:
+                seen[key] = 1
     return brief
+
+
+def _default_transform() -> LayerTransformBrief:
+    return LayerTransformBrief(**DEFAULT_LAYER_TRANSFORM)
+
+
+def looks_like_layer_folder_upload(attachments: list[AttachmentBrief]) -> bool:
+    """Root background image(s) + at least one categorized layer folder."""
+    images = [a for a in attachments if a.url and _is_image_attachment(a)]
+    has_background = any(a.is_background for a in images)
+    has_layers = any((a.category or "").strip() and not a.is_background for a in images)
+    return has_background and has_layers
+
+
+def apply_folder_layers(
+    brief: StudyBrief, attachments: list[AttachmentBrief]
+) -> StudyBrief:
+    """Map root-folder uploads onto a layer study.
+
+    - ``is_background`` attachments → ``background_image_url``
+    - categorized attachments → layers ordered by ``layer_order`` (then name)
+    - default transform ``0/0/100/100`` on every layer and element
+    """
+    data = brief.model_copy(deep=True)
+    images = [a for a in attachments if a.url and _is_image_attachment(a)]
+    backgrounds = [a for a in images if a.is_background]
+    layer_items = [
+        a for a in images if not a.is_background and (a.category or "").strip()
+    ]
+    if not layer_items:
+        return data
+
+    if backgrounds:
+        data.background_image_url = backgrounds[0].url
+
+    buckets: OrderedDict[str, list[AttachmentBrief]] = OrderedDict()
+    # Prefer explicit layer_order when present.
+    ordered_names = sorted(
+        {
+            (a.category or "").strip()[:100]
+            for a in layer_items
+            if (a.category or "").strip()
+        },
+        key=lambda name: (
+            min(
+                (
+                    a.layer_order
+                    for a in layer_items
+                    if (a.category or "").strip()[:100] == name
+                    and isinstance(a.layer_order, int)
+                ),
+                default=10_000,
+            ),
+            name.lower(),
+        ),
+    )
+    for name in ordered_names:
+        buckets[name] = [
+            a for a in layer_items if (a.category or "").strip()[:100] == name
+        ]
+
+    layers: list[LayerBrief] = []
+    for z_index, (name, items) in enumerate(buckets.items()):
+        elements: list[LayerElementBrief] = []
+        for img_i, att in enumerate(items):
+            elements.append(
+                LayerElementBrief(
+                    name=element_name_from_filename(att.filename or "image"),
+                    content=att.url,
+                    order=img_i,
+                    transform=_default_transform(),
+                )
+            )
+        layers.append(
+            LayerBrief(
+                name=name,
+                z_index=z_index,
+                order=z_index,
+                elements=elements,
+                transform=_default_transform(),
+            )
+        )
+
+    data.study_type = "layer"
+    data.layers = layers
+    # Layer studies don't use grid categories for stimuli.
+    data.categories = []
+    return _ensure_unique_element_names(data)
 
 
 def apply_folder_categories(
     brief: StudyBrief, attachments: list[AttachmentBrief]
 ) -> StudyBrief:
-    """Turn uploaded images into grid categories/elements.
+    """Turn uploaded images into grid categories/elements or layer packs.
 
     Priority:
+    0. Layer pack (root background + layer folders) → ``apply_folder_layers``.
     1. Explicit folder categories (subfolders) become categories.
     2. If everything collapsed into a single folder, try to derive sub-categories
        from a shared filename prefix (``Aura.Shape1`` → category ``Aura``).
@@ -108,9 +211,18 @@ def apply_folder_categories(
     Non-image uploads (PDF / Word / text) are ignored here — they feed the AI
     as document context instead of becoming grid elements.
     """
+    if looks_like_layer_folder_upload(attachments) or (
+        brief.study_type == "layer"
+        and any(
+            a.url and _is_image_attachment(a) and (a.category or a.is_background)
+            for a in attachments
+        )
+    ):
+        return apply_folder_layers(brief, attachments)
+
     data = brief.model_copy(deep=True)
     with_url = [a for a in attachments if a.url and _is_image_attachment(a)]
-    categorized = [a for a in with_url if a.category]
+    categorized = [a for a in with_url if a.category and not a.is_background]
 
     if categorized:
         buckets: OrderedDict[str, list[AttachmentBrief]] = OrderedDict()
@@ -143,7 +255,7 @@ def apply_folder_categories(
         return _ensure_unique_element_names(data)
 
     # No folder categories — flat images.
-    flat = [a for a in with_url if not a.category]
+    flat = [a for a in with_url if not a.category and not a.is_background]
     if not flat:
         return data
 
@@ -376,7 +488,10 @@ def _classification_pool_for_domain(domain: str) -> list[ClassificationQuestionB
 
 
 def ensure_default_classification(
-    brief: StudyBrief, *, avoid_texts: Iterable[str] | None = None
+    brief: StudyBrief,
+    *,
+    avoid_texts: Iterable[str] | None = None,
+    min_count: int | None = None,
 ) -> StudyBrief:
     """Guarantee enough screeners for the requested sample size.
 
@@ -384,11 +499,19 @@ def ensure_default_classification(
     each (e.g. 200 → 8, 300 → 9). Uses domain-specific questions (SMB/AI, fitness,
     visual) instead of generic packaging copy when that doesn't fit the study.
 
+    ``min_count`` raises the floor when the user asked for more screeners
+    (e.g. "add 5 more" / "at least 15 screening questions").
+
     ``avoid_texts`` holds questions the user just deleted, so backfilling never
     restores the exact question they asked to remove.
     """
     data = brief.model_copy(deep=True)
-    target = min_classification_question_count(data.audience.number_of_respondents)
+    capacity_floor = min_classification_question_count(
+        data.audience.number_of_respondents
+    )
+    target = capacity_floor
+    if isinstance(min_count, int) and min_count > 0:
+        target = max(target, min(min_count, 30))
     domain = _classification_domain(data)
     defaults = _classification_pool_for_domain(domain)
     blocked = {text.strip().lower() for text in (avoid_texts or []) if text.strip()}
@@ -415,7 +538,7 @@ def ensure_default_classification(
     extra = 1
     while len(padded) < target:
         text = f"How relevant is this topic to you right now ({extra})?"
-        if text.lower() not in existing_texts:
+        if text.lower() not in existing_texts and text.lower() not in blocked:
             padded.append(
                 ClassificationQuestionBrief(
                     question_text=text,

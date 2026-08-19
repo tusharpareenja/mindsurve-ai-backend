@@ -9,6 +9,7 @@ from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.db.models.chat import Chat, ChatMessage
+from app.db.models.membership import ProjectMember
 from app.db.models.project import Project
 
 
@@ -16,14 +17,57 @@ class ProjectRepository:
     def __init__(self, db: Session) -> None:
         self.db = db
 
+    def _accessible_project_ids(self, user_id: UUID):
+        """Subquery: projects the user owns or is an accepted member of."""
+        return (
+            select(Project.id)
+            .outerjoin(
+                ProjectMember,
+                and_(
+                    ProjectMember.project_id == Project.id,
+                    ProjectMember.user_id == user_id,
+                ),
+            )
+            .where(
+                or_(
+                    Project.creator_id == user_id,
+                    ProjectMember.user_id == user_id,
+                )
+            )
+        )
+
     # ── Projects (shared Unilever table: creator_id + name) ───────────────
 
     def list_projects_for_user(
         self, user_id: UUID, *, include_inbox: bool = True
     ) -> list[Project]:
-        stmt = select(Project).where(Project.creator_id == user_id)
+        stmt = (
+            select(Project)
+            .outerjoin(
+                ProjectMember,
+                and_(
+                    ProjectMember.project_id == Project.id,
+                    ProjectMember.user_id == user_id,
+                ),
+            )
+            .where(
+                or_(
+                    Project.creator_id == user_id,
+                    ProjectMember.user_id == user_id,
+                )
+            )
+            .distinct()
+        )
         if not include_inbox:
             stmt = stmt.where(Project.workflow_type != "inbox")
+        else:
+            # Never list someone else's inbox via membership
+            stmt = stmt.where(
+                or_(
+                    Project.workflow_type != "inbox",
+                    Project.creator_id == user_id,
+                )
+            )
         stmt = stmt.order_by(Project.updated_at.desc())
         return list(self.db.scalars(stmt).all())
 
@@ -40,6 +84,27 @@ class ProjectRepository:
         return self.db.scalars(stmt).first()
 
     def get_project_for_user(self, project_id: UUID, user_id: UUID) -> Project | None:
+        stmt = (
+            select(Project)
+            .outerjoin(
+                ProjectMember,
+                and_(
+                    ProjectMember.project_id == Project.id,
+                    ProjectMember.user_id == user_id,
+                ),
+            )
+            .where(
+                Project.id == project_id,
+                or_(
+                    Project.creator_id == user_id,
+                    ProjectMember.user_id == user_id,
+                ),
+            )
+        )
+        return self.db.scalars(stmt).first()
+
+    def get_owned_project(self, project_id: UUID, user_id: UUID) -> Project | None:
+        """Owner-only lookup (delete / destructive actions)."""
         stmt = select(Project).where(
             Project.id == project_id,
             Project.creator_id == user_id,
@@ -89,20 +154,23 @@ class ProjectRepository:
         return list(self.db.scalars(stmt).all())
 
     def list_chats_for_user(self, user_id: UUID) -> list[Chat]:
-        """All chats owned by the user (via project), one query + join."""
+        """All chats in projects the user owns or collaborates on."""
+        accessible = self._accessible_project_ids(user_id).subquery()
         stmt = (
             select(Chat)
-            .join(Project, Chat.project_id == Project.id)
-            .where(Project.creator_id == user_id)
+            .where(Chat.project_id.in_(select(accessible.c.id)))
             .order_by(Chat.updated_at.desc())
         )
         return list(self.db.scalars(stmt).all())
 
     def get_chat_for_user(self, chat_id: UUID, user_id: UUID) -> Chat | None:
+        accessible = self._accessible_project_ids(user_id).subquery()
         stmt = (
             select(Chat)
-            .join(Project, Chat.project_id == Project.id)
-            .where(Chat.id == chat_id, Project.creator_id == user_id)
+            .where(
+                Chat.id == chat_id,
+                Chat.project_id.in_(select(accessible.c.id)),
+            )
         )
         return self.db.scalars(stmt).first()
 

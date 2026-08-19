@@ -52,10 +52,107 @@ def element_uuid(study_id: UUID, category_name: str, element_name: str) -> UUID:
     )
 
 
+def layer_uuid(study_id: UUID, layer_name: str) -> UUID:
+    return uuid5(_MS_NAMESPACE, f"{study_id}:layer:{layer_name.strip().lower()}")
+
+
+def layer_image_uuid(study_id: UUID, layer_name: str, image_name: str) -> UUID:
+    return uuid5(
+        _MS_NAMESPACE,
+        f"{study_id}:layerimg:{layer_name.strip().lower()}:{image_name.strip().lower()}",
+    )
+
+
+def _classification_questions_payload(brief: StudyBrief) -> list[dict[str, Any]]:
+    classification_questions: list[dict[str, Any]] = []
+    for q_order, q in enumerate(brief.classification_questions, start=1):
+        options = [
+            {
+                "id": chr(ord("A") + opt_i) if opt_i < 26 else str(opt_i),
+                "text": opt_text[:200],
+                "order": opt_i + 1,
+            }
+            for opt_i, opt_text in enumerate(q.options)
+        ]
+        classification_questions.append(
+            {
+                "question_id": f"Q{q_order}"[:10],
+                "question_text": q.question_text.strip()[:500],
+                "question_type": "multiple_choice",
+                "is_required": q.is_required,
+                "order": q_order,
+                "answer_options": options,
+                "optional_classification_question": False,
+                "config": {},
+            }
+        )
+    return classification_questions
+
+
 def build_generate_tasks_payload(brief: StudyBrief, study_id: UUID) -> dict[str, Any]:
     """Map MindSurve StudyBrief → Unilever GenerateTasksRequest JSON."""
-    if brief.study_type not in {"grid", "text"}:
-        raise ValueError("study_type must be grid or text")
+    if brief.study_type not in {"grid", "text", "layer"}:
+        raise ValueError("study_type must be grid, text, or layer")
+
+    audience = audience_segmentation(brief)
+    rating = brief.rating_scale.model_dump()
+    classification_questions = _classification_questions_payload(brief)
+
+    base: dict[str, Any] = {
+        "study_id": str(study_id),
+        "last_step": 6,
+        "study_type": brief.study_type,
+        "audience_segmentation": audience,
+        "title": brief.title.strip()[:255],
+        "background": brief.background.strip(),
+        "language": (brief.language or "en")[:10],
+        "main_question": brief.main_question.strip(),
+        "orientation_text": brief.orientation_text.strip(),
+        "rating_scale": rating,
+        "classification_questions": classification_questions,
+        "tasks_per_respondent": 0,
+        "toggle_shuffle": False,
+    }
+
+    if brief.study_type == "layer":
+        default_transform = {"x": 0.0, "y": 0.0, "width": 100.0, "height": 100.0}
+        study_layers: list[dict[str, Any]] = []
+        for layer in brief.layers:
+            transform = (
+                layer.transform.model_dump() if layer.transform else default_transform
+            )
+            images = []
+            for el in layer.elements:
+                el_transform = (
+                    el.transform.model_dump() if el.transform else default_transform
+                )
+                images.append(
+                    {
+                        "image_id": str(layer_image_uuid(study_id, layer.name, el.name)),
+                        "name": el.name.strip()[:100],
+                        "url": (el.content or "").strip(),
+                        "alt_text": el.name.strip()[:200] or None,
+                        "order": int(el.order),
+                        "config": el_transform,
+                    }
+                )
+            study_layers.append(
+                {
+                    "layer_id": str(layer_uuid(study_id, layer.name)),
+                    "name": layer.name.strip()[:100],
+                    "description": None,
+                    "layer_type": "image",
+                    "z_index": int(layer.z_index),
+                    "order": int(layer.order),
+                    "transform": transform,
+                    "images": images,
+                }
+            )
+        base["study_layers"] = study_layers
+        base["background_image_url"] = (brief.background_image_url or "").strip() or None
+        base["categories"] = []
+        base["elements"] = []
+        return base
 
     categories: list[dict[str, Any]] = []
     elements: list[dict[str, Any]] = []
@@ -87,49 +184,9 @@ def build_generate_tasks_payload(brief: StudyBrief, study_id: UUID) -> dict[str,
                 }
             )
 
-    classification_questions: list[dict[str, Any]] = []
-    for q_order, q in enumerate(brief.classification_questions, start=1):
-        options = [
-            {
-                "id": chr(ord("A") + opt_i) if opt_i < 26 else str(opt_i),
-                "text": opt_text[:200],
-                "order": opt_i + 1,
-            }
-            for opt_i, opt_text in enumerate(q.options)
-        ]
-        classification_questions.append(
-            {
-                "question_id": f"Q{q_order}"[:10],
-                "question_text": q.question_text.strip()[:500],
-                "question_type": "multiple_choice",
-                "is_required": q.is_required,
-                "order": q_order,
-                "answer_options": options,
-                "optional_classification_question": False,
-                "config": {},
-            }
-        )
-
-    audience = audience_segmentation(brief)
-    rating = brief.rating_scale.model_dump()
-
-    return {
-        "study_id": str(study_id),
-        "last_step": 6,
-        "study_type": brief.study_type,
-        "audience_segmentation": audience,
-        "title": brief.title.strip()[:255],
-        "background": brief.background.strip(),
-        "language": (brief.language or "en")[:10],
-        "main_question": brief.main_question.strip(),
-        "orientation_text": brief.orientation_text.strip(),
-        "rating_scale": rating,
-        "classification_questions": classification_questions,
-        "categories": categories,
-        "elements": elements,
-        "tasks_per_respondent": 0,
-        "toggle_shuffle": False,
-    }
+    base["categories"] = categories
+    base["elements"] = elements
+    return base
 
 
 def brief_change_snapshot(brief: StudyBrief) -> dict[str, Any]:
@@ -157,6 +214,29 @@ def brief_change_snapshot(brief: StudyBrief) -> dict[str, Any]:
             }
             for c in brief.categories
         ],
+        "layers": [
+            {
+                "name": layer.name.strip(),
+                "z_index": layer.z_index,
+                "order": layer.order,
+                "transform": layer.transform.model_dump(mode="json")
+                if layer.transform
+                else {"x": 0, "y": 0, "width": 100, "height": 100},
+                "elements": [
+                    {
+                        "name": el.name.strip(),
+                        "content": (el.content or "").strip(),
+                        "order": el.order,
+                        "transform": el.transform.model_dump(mode="json")
+                        if el.transform
+                        else {"x": 0, "y": 0, "width": 100, "height": 100},
+                    }
+                    for el in layer.elements
+                ],
+            }
+            for layer in brief.layers
+        ],
+        "background_image_url": (brief.background_image_url or "").strip() or None,
         "classification_questions": [
             {
                 "question_text": q.question_text.strip(),
@@ -181,6 +261,8 @@ def task_affecting_snapshot(brief: StudyBrief) -> dict[str, Any]:
     return {
         "study_type": snapshot["study_type"],
         "categories": snapshot["categories"],
+        "layers": snapshot["layers"],
+        "background_image_url": snapshot["background_image_url"],
     }
 
 
@@ -193,7 +275,11 @@ def fingerprint_brief(brief: StudyBrief) -> str:
 def diff_task_affecting(before: StudyBrief, after: StudyBrief) -> list[str]:
     a = task_affecting_snapshot(before)
     b = task_affecting_snapshot(after)
-    return [key for key in ("study_type", "categories") if a.get(key) != b.get(key)]
+    return [
+        key
+        for key in ("study_type", "categories", "layers", "background_image_url")
+        if a.get(key) != b.get(key)
+    ]
 
 
 def diff_brief_fields(before: StudyBrief, after: StudyBrief) -> list[str]:
@@ -210,6 +296,8 @@ def diff_brief_fields(before: StudyBrief, after: StudyBrief) -> list[str]:
         "orientation_text",
         "rating_scale",
         "categories",
+        "layers",
+        "background_image_url",
         "classification_questions",
         "audience",
     ]
@@ -221,6 +309,7 @@ def diff_brief_fields(before: StudyBrief, after: StudyBrief) -> list[str]:
 
 RESEARCH_TIPS = [
     "Good research starts with clear categories — each set of images becomes a distinct research dimension.",
+    "Layer studies stack design options by z-index so respondents rate full composites, not isolated assets.",
     "MindGenomic matrices balance exposure so every element gets a fair chance to be evaluated.",
     "Screening questions help you understand who your respondents are before they rate stimuli.",
     "A balanced age and gender split makes insights more representative of your target market.",

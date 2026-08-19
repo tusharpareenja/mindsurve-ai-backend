@@ -38,6 +38,20 @@ class ProjectService:
         project = self.repo.get_project_for_user(project_id, user.id)
         if project is None:
             raise NotFoundError("Project not found.")
+        if not is_inbox_project(project):
+            try:
+                from app.services.collaborator_service import CollaboratorService
+
+                # Always commit after repair so study_members sync persists too.
+                CollaboratorService(self.db).repair_project_study_links(project.id)
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                import logging
+
+                logging.getLogger(__name__).exception(
+                    "Study link repair failed for project %s", project.id
+                )
         return project
 
     def ensure_inbox(self, user: User) -> Project:
@@ -104,7 +118,16 @@ class ProjectService:
             raise
 
     def delete_project(self, user: User, project_id: UUID) -> None:
-        project = self.get_project(user, project_id)
+        project = self.repo.get_owned_project(project_id, user.id)
+        if project is None:
+            # Distinguish not found vs not owner when user can see the project
+            accessible = self.repo.get_project_for_user(project_id, user.id)
+            if accessible is not None:
+                raise AppError(
+                    "Only the project owner can delete this project.",
+                    status_code=403,
+                )
+            raise NotFoundError("Project not found.")
         if is_inbox_project(project):
             raise AppError(
                 "Personal chats can’t be deleted as a project. Delete individual chats instead.",
@@ -229,6 +252,14 @@ class ProjectService:
                 self.repo.save_project(target_project)
                 if old_project is not None and old_project.id != target_project.id:
                     self.repo.save_project(old_project)
+                # Studies created while chat was in inbox have project_id=null —
+                # affiliate them with the destination named project for Unilever.
+                if not is_inbox_project(target_project):
+                    from app.services.collaborator_service import CollaboratorService
+
+                    CollaboratorService(self.db).ensure_chat_studies_linked(
+                        chat, target_project
+                    )
             self.repo.save_chat(chat)
             self.db.commit()
             self.db.refresh(chat)

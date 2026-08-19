@@ -17,11 +17,14 @@ from app.schemas.project import (
     ChatStart,
     ChatStartOut,
     ChatUpdate,
+    CollaboratorInvite,
+    CollaboratorInviteResult,
     MessageCreate,
     MessageOut,
     MessagePageOut,
     MessageResponse,
 )
+from app.services.collaborator_service import CollaboratorService
 from app.services.project_service import ProjectService
 
 router = APIRouter(tags=["chats"])
@@ -29,6 +32,10 @@ router = APIRouter(tags=["chats"])
 
 def get_project_service(db: Session = Depends(get_db)) -> ProjectService:
     return ProjectService(db)
+
+
+def get_collaborator_service(db: Session = Depends(get_db)) -> CollaboratorService:
+    return CollaboratorService(db)
 
 
 def _raise(exc: AppError) -> None:
@@ -124,6 +131,49 @@ def get_chat(
     except AppError as exc:
         _raise(exc)
     return ChatOut.model_validate(chat)
+
+
+@router.post(
+    "/chats/{chat_id}/collaborators",
+    response_model=CollaboratorInviteResult,
+    status_code=status.HTTP_201_CREATED,
+)
+def invite_chat_collaborator(
+    chat_id: UUID,
+    body: CollaboratorInvite,
+    user: User = Depends(get_current_user),
+    service: CollaboratorService = Depends(get_collaborator_service),
+) -> CollaboratorInviteResult:
+    """Invite someone to collaborate on this chat's project.
+
+    Personal/inbox chats are moved into a new named project automatically.
+    """
+    try:
+        member, project, promoted = service.invite_for_chat(
+            user, chat_id, email=body.email
+        )
+    except AppError as exc:
+        _raise(exc)
+    pending = member.user_id is None
+    if promoted:
+        message = (
+            "Shared chat moved into a new project and invitation sent."
+            if pending
+            else "Shared chat moved into a new project and collaborator added."
+        )
+    elif pending:
+        message = "Invitation sent. They’ll see this project after signing in."
+    else:
+        message = "Collaborator added. They can open this project now."
+    return CollaboratorInviteResult(
+        id=str(member.id),
+        email=member.invited_email,
+        status="pending" if pending else "active",
+        message=message,
+        project_id=project.id,
+        chat_id=chat_id,
+        promoted_from_inbox=promoted,
+    )
 
 
 @router.patch("/chats/{chat_id}", response_model=ChatOut)

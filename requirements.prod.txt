@@ -1,0 +1,20 @@
+# Production / Docker install set (no editable git deps, no pytest).
+# Prefer: pip install .  (see Dockerfile). This file is for platforms that want a flat requirements list.
+
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+sqlalchemy>=2.0.36
+alembic>=1.14.0
+psycopg[binary]>=3.2.0
+pydantic>=2.10.0
+pydantic-settings>=2.6.0
+httpx>=0.28.0
+PyJWT[crypto]>=2.9.0
+bcrypt>=4.2.0
+email-validator>=2.2.0
+openai>=1.50.0
+azure-storage-blob>=12.23.0
+python-multipart>=0.0.12
+pypdf>=5.0.0
+python-docx>=1.1.0
+python-dotenv>=1.0.0

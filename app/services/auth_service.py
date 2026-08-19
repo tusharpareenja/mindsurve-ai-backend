@@ -68,6 +68,9 @@ class AuthService:
                 email=email,
                 password_hash=password_hash,
             )
+            from app.services.collaborator_service import CollaboratorService
+
+            CollaboratorService(self.db).claim_pending_invites(user)
             result = self._issue_tokens(
                 user,
                 user_agent=user_agent,
@@ -97,6 +100,9 @@ class AuthService:
             raise AuthError("Invalid email or password.")
 
         try:
+            from app.services.collaborator_service import CollaboratorService
+
+            CollaboratorService(self.db).claim_pending_invites(user)
             self.repo.touch_last_login(user)
             result = self._issue_tokens(
                 user,

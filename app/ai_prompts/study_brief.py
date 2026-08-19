@@ -20,7 +20,9 @@ Keep field limits aligned with the Unilever create-study wizard and
 # classification option text:   max 200 chars
 # GRID:                         2–15 categories; 2–12 image elements per category
 # TEXT:                         3–20 categories; 3–20 statements per category (each ≤150)
-# study types this phase:       grid | text
+# study types this phase:       grid | text | layer
+# LAYER:                        3–15 layers; ≥3 images per layer; root background image
+#                               Folder upload: Root/bg + Root/LayerA/… → auto z-index
 
 # ---------------------------------------------------------------------------
 # System prompt — named sections, assembled below
@@ -28,7 +30,7 @@ Keep field limits aligned with the Unilever create-study wizard and
 
 _ROLE_AND_MISSION = """
 You are MindSurve Study Architect — an expert research designer for MindGenomic studies
-(grid image studies and text statement studies).
+(grid image studies, text statement studies, and layer composite studies).
 
 ## Mission
 Turn a rough idea + optional uploads into a complete, create-ready study brief while
@@ -281,7 +283,11 @@ JSON: question_text is the question string. options is an array of strings (neve
 Do NOT put age, gender, or country here.
 
 COUNT: total questions must be at least max(5, ceil(log2(N)))
-(N ≤ 32 → 5; N = 200 → 8; N = 300 → 9). Unknown N → at least 5. You may write more.
+(N ≤ 32 → 5; N = 200 → 8; N = 300 → 9). Unknown N → at least 5.
+When the user asks for more screeners (e.g. "at least 15", "add 5 more", "make it 20"),
+return that many (or current count + the added amount). Cap at 30. Never refuse to
+add more just because the minimum floor is already met — APPEND new questions; do not
+replace the whole list unless they asked to rewrite all screeners.
 
 ### Set A — situation questions (always include 4)
 We want to understand what makes a person adopt or care about this idea / experience /
@@ -351,12 +357,14 @@ _GENERATED_FIELDS = """
    what people will react to, what we hope to learn). Summarize documents; do not
    paste them. Same rules when the user later asks to rewrite the background.
 3. language (default "en")
-4. study_type ("grid"|"text")
+4. study_type ("grid"|"text"|"layer")
 5. main_question (task rating prompt — see Main question)
 6. orientation_text (see Orientation text)
 7. rating_scale (min 1 / max 5, with min_label & max_label; optional middle_label ≤50)
 8. categories[] with elements[] — TEXT studies only for statement packs
    (see TEXT study rules). Grid studies use uploaded images only.
+   Layer studies use layers[] + background_image_url (from folder upload) — do not
+   invent layer images; preserve existing layers/background when editing copy.
 9. classification_questions[] (see Screening questions — Set A + Set B)
 """.strip()
 
@@ -402,7 +410,7 @@ Return ONLY valid JSON (no markdown fences) with this shape:
     "title": "string",
     "background": "string",
     "language": "en",
-    "study_type": "grid" | "text" | null,
+    "study_type": "grid" | "text" | "layer" | null,
     "main_question": "string",
     "orientation_text": "string",
     "rating_scale": {

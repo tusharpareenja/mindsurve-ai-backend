@@ -79,7 +79,7 @@ class StudyBriefService:
         self.version_repo = StudyBriefVersionRepository(db)
 
     def get_brief(self, user: User, chat_id: UUID) -> tuple[BriefPhase, StudyBrief]:
-        chat, _project = self._owned_chat(user, chat_id)
+        chat, project = self._owned_chat(user, chat_id)
         brief = self._load_brief(chat)
         try:
             if self._ensure_initial_version(chat, brief):
@@ -87,8 +87,27 @@ class StudyBriefService:
         except Exception:
             logger.exception("Could not seed brief version history")
             self.db.rollback()
-            chat, _project = self._owned_chat(user, chat_id)
+            chat, project = self._owned_chat(user, chat_id)
             brief = self._load_brief(chat)
+
+        # Heal orphan Unilever studies (project_id null) for chats already in a named project.
+        if brief.study_id and project is not None and not is_inbox_project(project):
+            try:
+                from app.services.collaborator_service import CollaboratorService
+
+                if CollaboratorService(self.db).ensure_study_linked_to_project(
+                    study_id=brief.study_id,
+                    project_id=project.id,
+                ):
+                    self.db.commit()
+            except Exception:
+                self.db.rollback()
+                logger.exception(
+                    "Could not link study %s to project %s",
+                    brief.study_id,
+                    project.id,
+                )
+
         phase = self._phase_from_brief(brief)
         return phase, brief
 
@@ -295,21 +314,39 @@ class StudyBriefService:
             brief = apply_folder_categories(brief, attachments)
             user_meta = {
                 "kind": "attachments",
-                "attachments": [
-                    a.model_dump(exclude={"extracted_text"}) for a in attachments
-                ],
+                "attachments": self._summarize_attachments_for_ai(attachments),
             }
             if not body:
+                layer_names = [layer.name for layer in brief.layers if layer.name]
                 cats = sorted({a.category for a in attachments if a.category})
-                if cats:
+                if brief.study_type == "layer" and (
+                    layer_names or brief.background_image_url
+                ):
+                    body = (
+                        f"Uploaded a layer study pack: background"
+                        f"{' + ' + ', '.join(layer_names) if layer_names else ''} "
+                        f"({len(attachments)} image(s))."
+                    )
+                elif cats:
                     body = (
                         f"Uploaded {len(attachments)} image(s) across "
                         f"{len(cats)} categor{'y' if len(cats) == 1 else 'ies'}: "
                         + ", ".join(cats)
                     )
                 else:
-                    body = f"Uploaded {len(attachments)} file(s): " + ", ".join(
-                        a.filename or a.url for a in attachments
+                    names = [
+                        a.filename
+                        for a in attachments[:12]
+                        if a.filename
+                    ]
+                    extra = (
+                        f" (+{len(attachments) - len(names)} more)"
+                        if len(attachments) > len(names)
+                        else ""
+                    )
+                    body = (
+                        f"Uploaded {len(attachments)} file(s)"
+                        + (f": {', '.join(names)}{extra}" if names else ".")
                     )
 
         try:
@@ -703,6 +740,22 @@ class StudyBriefService:
         chat, project = self._owned_chat(user, chat_id)
         brief = self._load_brief(chat)
         if brief.study_id and brief.status == "created":
+            if not is_inbox_project(project):
+                from app.services.collaborator_service import CollaboratorService
+
+                try:
+                    CollaboratorService(self.db).ensure_study_linked_to_project(
+                        study_id=brief.study_id,
+                        project_id=project.id,
+                    )
+                    self.db.commit()
+                except Exception:
+                    self.db.rollback()
+                    logger.exception(
+                        "Failed to ensure study %s linked to project %s",
+                        brief.study_id,
+                        project.id,
+                    )
             return StudyConfirmResponse(
                 study_id=brief.study_id,
                 phase="created",
@@ -730,6 +783,13 @@ class StudyBriefService:
                 project_id=unilever_project_id,
                 brief=brief,
             )
+            if unilever_project_id is not None:
+                from app.services.collaborator_service import CollaboratorService
+
+                CollaboratorService(self.db).ensure_study_linked_to_project(
+                    study_id=study_id,
+                    project_id=unilever_project_id,
+                )
             brief.study_id = study_id
             brief.status = "created"
             brief.missing_fields = []
@@ -1224,9 +1284,25 @@ class StudyBriefService:
             for q in prior.classification_questions
             if q.question_text.strip() and q.question_text.strip().lower() not in kept
         ]
-        new_brief = ensure_default_classification(
-            new_brief, avoid_texts=removed_questions
+        screening_target = self._requested_screening_count(
+            last_ask, current_count=len(prior.classification_questions)
         )
+        new_brief = ensure_default_classification(
+            new_brief,
+            avoid_texts=removed_questions,
+            min_count=screening_target,
+        )
+        # If the model returned a valid longer screener list, prefer it over padding.
+        targets = self._edit_targets(corpus, ai_payload)
+        if "classification_questions" in targets:
+            new_brief = self._overlay_gpt_fields(
+                new_brief, ai_payload, ["classification_questions"]
+            )
+            new_brief = ensure_default_classification(
+                new_brief,
+                avoid_texts=removed_questions,
+                min_count=screening_target,
+            )
         new_brief = apply_defaults(new_brief)
         if brief.status == "created":
             new_brief.status = "created"
@@ -1398,6 +1474,69 @@ class StudyBriefService:
         return None
 
     @staticmethod
+    def _parse_count_token(token: str) -> int | None:
+        token = (token or "").strip().lower()
+        if token.isdigit():
+            return int(token)
+        return StudyBriefService._WORD_COUNTS.get(token)
+
+    @staticmethod
+    def _requested_screening_count(text: str, *, current_count: int) -> int | None:
+        """Target screener count from the latest user ask (absolute or +N more)."""
+        last = (text or "").strip().split("\n")[-1].lower()
+        if not last:
+            return None
+        asks_screeners = any(
+            word in last
+            for word in (
+                "screening",
+                "screener",
+                "screeners",
+                "classification",
+                "question",
+                "questions",
+            )
+        )
+        add_more = re.search(
+            r"(?:add|give(?:\s+me)?|include|need)\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+more",
+            last,
+        )
+        if add_more:
+            n = StudyBriefService._parse_count_token(add_more.group(1))
+            if n and n > 0:
+                return min(30, max(current_count, 0) + n)
+        if (
+            re.search(r"\badd(?:\s+\w+){0,2}\s+more\b", last)
+            or re.search(r"\bmore\s+screening\b", last)
+            or re.search(r"\bmore\s+screener", last)
+            or re.search(r"\bmore\s+questions?\b", last)
+        ) and asks_screeners:
+            return min(30, max(current_count, 0) + 5)
+
+        absolute = re.search(
+            r"(?:at\s*least|minimum|min(?:imum)?|make it|want|need|to)\s+(\d+|ten|fifteen|twenty)\s+"
+            r"(?:screening|screener|classification)?\s*questions?",
+            last,
+        )
+        if absolute:
+            raw = absolute.group(1)
+            if raw == "fifteen":
+                n = 15
+            elif raw == "twenty":
+                n = 20
+            else:
+                n = StudyBriefService._parse_count_token(raw)
+            if n and 1 <= n <= 30:
+                return n
+
+        if asks_screeners:
+            digits = [int(token) for token in re.findall(r"\d+", last)]
+            valid = [n for n in digits if 5 <= n <= 30]
+            if valid:
+                return valid[-1]
+        return None
+
+    @staticmethod
     def _looks_like_edit(text: str) -> bool:
         """True when the latest user line is asking to change the draft."""
         last = (text or "").strip().split("\n")[-1].lower()
@@ -1411,6 +1550,7 @@ class StudyBriefService:
             "remove",
             "delete",
             "add ",
+            "add more",
             "make ",
             "want",
             "duplicate",
@@ -1422,6 +1562,9 @@ class StudyBriefService:
             "swap",
             "drop ",
             "merge",
+            "more question",
+            "more screening",
+            "more screener",
         )
         asked_to_change = any(word in last for word in edit_words)
         if not asked_to_change:
@@ -1467,6 +1610,8 @@ class StudyBriefService:
                 "content_type": att.content_type or "",
                 "category": att.category,
                 "relative_path": att.relative_path,
+                "is_background": bool(att.is_background),
+                "layer_order": att.layer_order,
                 "has_url": bool(att.url),
                 "is_document": bool(excerpt) or (
                     (att.content_type or "").lower()
@@ -1484,9 +1629,61 @@ class StudyBriefService:
             "content_type": str(att.get("content_type") or ""),
             "category": att.get("category"),
             "relative_path": att.get("relative_path"),
+            "is_background": bool(att.get("is_background")),
+            "layer_order": att.get("layer_order"),
             "has_url": bool(att.get("url")),
             "is_document": bool(excerpt),
             "extracted_chars": len(excerpt) if excerpt else 0,
+        }
+
+    def _summarize_attachments_for_ai(
+        self, attachments: list[AttachmentBrief]
+    ) -> list[dict[str, Any]] | dict[str, Any]:
+        """Keep AI prompts small for large layer/grid packs (dozens of images)."""
+        if len(attachments) <= 20:
+            return [self._compact_attachment_for_ai(a) for a in attachments]
+
+        backgrounds = [a for a in attachments if a.is_background]
+        by_folder: dict[str, list[AttachmentBrief]] = {}
+        other: list[AttachmentBrief] = []
+        for att in attachments:
+            if att.is_background:
+                continue
+            folder = (att.category or "").strip()
+            if folder:
+                by_folder.setdefault(folder, []).append(att)
+            else:
+                other.append(att)
+
+        folders = []
+        for name in sorted(by_folder.keys(), key=str.lower):
+            items = by_folder[name]
+            folders.append(
+                {
+                    "folder": name,
+                    "count": len(items),
+                    "sample_filenames": [
+                        (a.filename or "") for a in items[:5] if a.filename
+                    ],
+                    "layer_order": next(
+                        (
+                            a.layer_order
+                            for a in items
+                            if isinstance(a.layer_order, int)
+                        ),
+                        None,
+                    ),
+                }
+            )
+        return {
+            "total": len(attachments),
+            "summarized": True,
+            "background_count": len(backgrounds),
+            "background_filenames": [
+                (a.filename or "") for a in backgrounds[:3] if a.filename
+            ],
+            "folders": folders,
+            "uncategorized_count": len(other),
         }
 
     @staticmethod
@@ -1511,11 +1708,49 @@ class StudyBriefService:
             used += take
         return "\n\n".join(chunks) if chunks else "(none this turn)"
 
+    @staticmethod
+    def _compact_elements_for_ai(
+        elements: list[dict[str, Any]], *, limit: int = 8
+    ) -> dict[str, Any]:
+        names = [str(e.get("name") or "") for e in elements if e.get("name")]
+        return {
+            "element_count": len(elements),
+            "element_names": names[:limit],
+            "elements_truncated": len(names) > limit,
+        }
+
     def _compact_brief_for_ai(self, brief: StudyBrief) -> dict[str, Any]:
         data = brief.model_dump(mode="json")
-        data["attachments"] = [
-            self._compact_attachment_for_ai(a) for a in brief.attachments
-        ]
+        data["attachments"] = self._summarize_attachments_for_ai(brief.attachments)
+
+        # Drop huge Azure URLs from categories / layers — names + counts are enough.
+        compact_cats: list[dict[str, Any]] = []
+        for cat in data.get("categories") or []:
+            els = cat.get("elements") or []
+            compact_cats.append(
+                {
+                    "name": cat.get("name"),
+                    "order": cat.get("order"),
+                    **self._compact_elements_for_ai(els),
+                }
+            )
+        data["categories"] = compact_cats
+
+        compact_layers: list[dict[str, Any]] = []
+        for layer in data.get("layers") or []:
+            els = layer.get("elements") or []
+            compact_layers.append(
+                {
+                    "name": layer.get("name"),
+                    "z_index": layer.get("z_index"),
+                    "order": layer.get("order"),
+                    **self._compact_elements_for_ai(els),
+                }
+            )
+        data["layers"] = compact_layers
+        if data.get("background_image_url"):
+            data["background_image_url"] = "(set)"
+            data["has_background_image"] = True
         return data
 
     @staticmethod
@@ -1788,6 +2023,16 @@ class StudyBriefService:
                 "I can draft the statements for this text study, or you can paste them "
                 "here / upload a PDF or Word file and I’ll use that."
             )
+        if "layers_min_3" in missing and brief.study_type == "layer":
+            return (
+                "Upload a root folder with a background image at the top and at least "
+                "three layer folders inside — each folder becomes a layer (z-0, z-1, …)."
+            )
+        if "background_image" in missing and brief.study_type == "layer":
+            return (
+                "Add a background image at the root of your layer folder (next to the "
+                "layer subfolders), then re-upload."
+            )
         return "Great — what would you like to add or refine next?"
 
     THINKING_SYSTEM = """
@@ -1882,13 +2127,30 @@ so the user can follow along while the draft is being built.
             conversation_transcript="\n".join(transcript_lines) or "(empty)",
             user_message=user_message,
             new_attachments_json=json.dumps(
-                [self._compact_attachment_for_ai(a) for a in new_attachments],
+                self._summarize_attachments_for_ai(new_attachments),
                 ensure_ascii=False,
             ),
             document_excerpts=self._all_document_excerpts(brief, new_attachments),
             version_history_json=self._version_history_for_ai(chat.id),
         )
-        return chat_json(system_prompt=STUDY_BRIEF_SYSTEM_PROMPT, user_prompt=user_prompt)
+        try:
+            return chat_json(
+                system_prompt=STUDY_BRIEF_SYSTEM_PROMPT, user_prompt=user_prompt
+            )
+        except AppError as exc:
+            # Large packs can still time out; keep the folder-mapped brief via heuristic.
+            if getattr(exc, "status_code", None) == 504:
+                logger.warning(
+                    "OpenAI timed out on ai-turn; falling back to heuristic brief"
+                )
+                return self._heuristic_ai(
+                    brief,
+                    user_message,
+                    new_attachments,
+                    siblings=siblings,
+                    chat=chat,
+                )
+            raise
 
     def _heuristic_ai(
         self,
@@ -1974,10 +2236,15 @@ so the user can follow along while the draft is being built.
 
         if new_attachments:
             brief.merge_attachments(new_attachments)
-            for att in new_attachments:
-                ctype = (att.content_type or "").lower()
-                if ctype.startswith("image/") and brief.study_type is None:
-                    brief.study_type = "grid"
+            from app.services.folder_brief import looks_like_layer_folder_upload
+
+            if looks_like_layer_folder_upload(brief.attachments):
+                brief.study_type = "layer"
+            else:
+                for att in new_attachments:
+                    ctype = (att.content_type or "").lower()
+                    if ctype.startswith("image/") and brief.study_type is None:
+                        brief.study_type = "grid"
 
         has_document = any((a.extracted_text or "").strip() for a in new_attachments)
         wants_text = (
@@ -1990,12 +2257,22 @@ so the user can follow along while the draft is being built.
             or "without image" in lower
             or "statements" in lower
         )
+        wants_layer = (
+            "layer study" in lower
+            or "layered study" in lower
+            or "layer-based" in lower
+            or "pack shot" in lower
+            or "packshot" in lower
+            or "composite design" in lower
+        )
         if wants_text or (has_document and brief.study_type is None):
             brief.study_type = "text"
+        elif wants_layer:
+            brief.study_type = "layer"
         elif "grid" in lower or "logo" in lower or (
             "image" in lower and "no image" not in lower and "without image" not in lower
         ):
-            if brief.study_type != "text":
+            if brief.study_type not in {"text", "layer"}:
                 brief.study_type = "grid"
 
         if brief.study_type == "text":
@@ -2065,6 +2342,12 @@ so the user can follow along while the draft is being built.
                 "upload an image for each element (or tell me you don’t have images and "
                 "I’ll switch to a text study), then press Continue when you’re ready."
             )
+        elif ready and not create_ready and brief.study_type == "layer":
+            msg = (
+                "I’ve set this up as a **layer study**. Upload a root folder with a "
+                "background image at the top and one folder per layer — we’ll map "
+                "z-index automatically. Then press Continue when you’re ready."
+            )
         elif ready:
             msg = (
                 "Your study brief looks complete. Review the summary and press "
@@ -2076,11 +2359,18 @@ so the user can follow along while the draft is being built.
                 "instead of images. You can edit the statements on the brief card, paste "
                 "more here, or upload a PDF / Word file."
             )
+        elif brief.study_type == "layer":
+            msg = (
+                "I’ve started a **layer study**. Upload one root folder: put the "
+                "background image at the root, and put each layer’s options in its own "
+                "subfolder (folder order becomes z-index)."
+            )
         elif brief.study_type is None:
             msg = (
                 "Absolutely — **what are you trying to learn or test?**\n\n"
                 "If you have images (logos, designs, packaging), upload them. "
-                "If not, say so and I’ll build a text study with statements to rate."
+                "For layered pack shots, upload a root folder with a background + layer folders. "
+                "If you don’t have images, say so and I’ll build a text study."
             )
         else:
             msg = (
@@ -2226,6 +2516,8 @@ so the user can follow along while the draft is being built.
         "orientation_text",
         "rating_scale",
         "categories",
+        "layers",
+        "background_image_url",
         "classification_questions",
         "audience",
     )
@@ -2238,6 +2530,14 @@ so the user can follow along while the draft is being built.
         for key in self._BRIEF_MERGE_KEYS:
             if key not in raw:
                 continue
+            # Never demote an existing layer pack to grid/text via a partial AI reply.
+            if (
+                key == "study_type"
+                and current.study_type == "layer"
+                and current.layers
+                and str(raw.get("study_type") or "").strip().lower() != "layer"
+            ):
+                continue
             trial = dict(data)
             trial[key] = raw[key]
             try:
@@ -2247,6 +2547,14 @@ so the user can follow along while the draft is being built.
                 continue
             if key == "categories" and current.categories and not candidate.categories:
                 continue
+            if key == "layers" and current.layers and not candidate.layers:
+                continue
+            if (
+                key == "background_image_url"
+                and current.background_image_url
+                and not str(candidate.background_image_url or "").strip()
+            ):
+                continue
             if (
                 key == "classification_questions"
                 and current.classification_questions
@@ -2254,6 +2562,17 @@ so the user can follow along while the draft is being built.
             ):
                 continue
             data[key] = raw[key]
+
+        # Preserve layer structure if the model omitted it while editing screeners.
+        if current.study_type == "layer" and current.layers:
+            data["study_type"] = "layer"
+            if not data.get("layers"):
+                data["layers"] = [layer.model_dump(mode="json") for layer in current.layers]
+            if current.background_image_url and not data.get("background_image_url"):
+                data["background_image_url"] = current.background_image_url
+            # Layer packs don't use grid categories for stimuli.
+            data["categories"] = []
+
         return StudyBrief.model_validate(data)
 
     def _brief_from_ai(self, current: StudyBrief, payload: dict[str, Any]) -> StudyBrief:
